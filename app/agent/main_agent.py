@@ -1,7 +1,7 @@
 """
 主智能体组装与异步执行模块
 
-负责把模型、主提示词、文件类工具和三个专家子智能体组装成 DeepAgent，
+负责把模型、主提示词、交付类工具和三个专家子智能体组装成 DeepAgent，
 并提供 run_deep_agent 作为后续 API 层调用的统一入口。运行时还会为每个
 session_id 创建独立工作目录，并把工具调用、子智能体调用和最终结果推送给前端。
 """
@@ -16,7 +16,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
 from app.agent.subagents.database_query_agent import database_query_agent
-from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
+from app.agent.subagents.file_analysis_agent import file_analysis_agent
 from app.agent.subagents.network_search_agent import network_search_agent
 from app.api.context import (
     reset_session_context,
@@ -25,21 +25,20 @@ from app.api.context import (
 )
 from app.api.monitor import monitor
 
-# 文件类工具由主智能体直接掌握，负责读取上传附件和生成最终交付文档
+# 交付类工具由主智能体直接掌握，负责生成最终 Markdown/PDF 文档
 from app.tools.markdown_tools import generate_markdown
 from app.tools.pdf_tools import convert_md_to_pdf
-from app.tools.upload_file_read_tool import read_file_content
 
 # 主智能体是调度中心：
-# 1. tools 只放最终交付相关的文件工具
-# 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
+# 1. tools 只放最终交付相关的文件生成工具
+# 2. subagents 放网络、数据库、文件分析三类信息获取助手
 # 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
 main_agent = create_deep_agent(
     model=model,
     system_prompt=main_agent_content["system_prompt"],
-    tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+    tools=[generate_markdown, convert_md_to_pdf],
     checkpointer=InMemorySaver(),
-    subagents=[database_query_agent, network_search_agent, knowledge_base_agent],
+    subagents=[database_query_agent, network_search_agent, file_analysis_agent],
 )
 
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
@@ -82,7 +81,7 @@ async def run_deep_agent(task_query, session_id):
             updated_info_prompt = (
                 "\n    [已上传文件] 已加载到工作目录:\n"
                 + "\n".join([f"    - {f}" for f in files])
-                + "\n    请优先使用工具（read_file_content）读取并参考这些文件。"
+                + "\n    请优先调用文件分析助手读取并分析这些文件。"
             )
 
     # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
@@ -103,7 +102,7 @@ async def run_deep_agent(task_query, session_id):
 
     规则：
     1. 新生成文件必须保存到工作目录：'{relative_session_dir_str}/filename'
-    2. 读取已上传的文件时，请直接将文件名（例如：'开篇.txt'）作为 filename 参数传入（read_file_content）读取工具，不要带上任何目录前缀。
+    2. 读取已上传的文件时，请调用文件分析助手，并要求它直接将文件名（例如：'开篇.txt'）作为 filename 参数传入读取工具，不要带上任何目录前缀。
     3. 使用相对路径，禁止使用绝对路径
     4. 若存在上传文件，请先分析内容
     """

@@ -194,7 +194,7 @@ export default function App() {
             </li>
             <li>
               <FileSearchOutlined aria-hidden />
-              RAGFlow 助手
+              文件分析助手
             </li>
           </ul>
         </div>
