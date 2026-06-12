@@ -1,7 +1,7 @@
 """
 请求上下文管理模块
 
-负责在异步请求链路中保存当前任务的 thread_id 和 session_dir
+负责在异步请求链路中保存当前任务的 thread_id、trace_id 和 session_dir
 工具、智能体和监控模块可以在深层调用中读取这些值，而不需要层层传参
 """
 
@@ -16,6 +16,10 @@ _session_dir_ctx: ContextVar[Optional[str]] = ContextVar(
 )
 _thread_id_ctx: ContextVar[Optional[str]] = ContextVar(
     "thread_id",
+    default=None,
+)
+_trace_id_ctx: ContextVar[Optional[str]] = ContextVar(
+    "trace_id",
     default=None,
 )
 
@@ -56,6 +60,43 @@ def get_thread_context() -> Optional[str]:
     :return: 当前任务 ID；未设置时返回 None
     """
     return _thread_id_ctx.get()
+
+
+def reset_thread_context(thread_token: Token[Optional[str]]) -> None:
+    """
+    恢复 thread 上下文
+
+    :param thread_token: set_thread_context 返回的 token
+    """
+    _thread_id_ctx.reset(thread_token)
+
+
+def set_trace_context(trace_id: str) -> Token[Optional[str]]:
+    """
+    设置当前请求链路的 trace ID
+
+    :param trace_id: 单次任务执行链路 ID
+    :return: reset 时需要使用的上下文 token
+    """
+    return _trace_id_ctx.set(trace_id)
+
+
+def get_trace_context() -> Optional[str]:
+    """
+    获取当前请求链路的 trace ID
+
+    :return: 当前链路 ID；未设置时返回 None
+    """
+    return _trace_id_ctx.get()
+
+
+def reset_trace_context(trace_token: Token[Optional[str]]) -> None:
+    """
+    恢复 trace 上下文，避免链路 ID 串到后续请求
+
+    :param trace_token: set_trace_context 返回的 token
+    """
+    _trace_id_ctx.reset(trace_token)
 
 
 def reset_session_context(

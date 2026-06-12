@@ -17,6 +17,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
+from app.observability.tracing import trace_span
 from app.utils.path_utils import resolve_path
 from app.utils.word_converter import convert_md_to_pdf as convert_md_to_pdf_via_word
 
@@ -35,30 +36,54 @@ def convert_md_to_pdf(
     :param pdf_filename: 可选 PDF 输出文件名；不传时与 Markdown 同名
     :return: 转换结果说明
     """
-    monitor.report_tool("Markdown转PDF工具")
+    monitor.report_tool(
+        "Markdown转PDF工具",
+        {"md_filename": md_filename, "pdf_filename": pdf_filename},
+    )
 
-    try:
-        # 输入路径必须先落到当前会话目录，避免模型传入任意系统路径
-        session_dir = get_session_context()
-        md_path = Path(md_filename).with_suffix(".md")
-        md_abs_path = Path(resolve_path(str(md_path), session_dir))
+    with trace_span(
+        "tool.convert_md_to_pdf",
+        component="tool",
+        metadata={
+            "tool_name": "convert_md_to_pdf",
+            "md_filename": md_filename,
+            "pdf_filename": pdf_filename,
+        },
+    ) as span:
+        try:
+            # 输入路径必须先落到当前会话目录，避免模型传入任意系统路径
+            session_dir = get_session_context()
+            md_path = Path(md_filename).with_suffix(".md")
+            md_abs_path = Path(resolve_path(str(md_path), session_dir))
 
-        if not md_abs_path.exists():
-            return f"错误：文件不存在 {md_abs_path}"
+            if not md_abs_path.exists():
+                span.set_result(error_message=f"文件不存在 {md_abs_path}")
+                return f"错误：文件不存在 {md_abs_path}"
 
-        # 未指定 PDF 文件名时，默认与源 Markdown 同目录同名
-        if pdf_filename:
-            pdf_path = Path(pdf_filename).with_suffix(".pdf")
-            pdf_abs_path = Path(resolve_path(str(pdf_path), session_dir))
-        else:
-            pdf_abs_path = md_abs_path.with_suffix(".pdf")
+            # 未指定 PDF 文件名时，默认与源 Markdown 同目录同名
+            if pdf_filename:
+                pdf_path = Path(pdf_filename).with_suffix(".pdf")
+                pdf_abs_path = Path(resolve_path(str(pdf_path), session_dir))
+            else:
+                pdf_abs_path = md_abs_path.with_suffix(".pdf")
 
-        # PDF 版式、中文字体和 Markdown 解析细节都封装在底层转换模块中
-        return convert_md_to_pdf_via_word(md_abs_path, pdf_abs_path)
+            # PDF 版式、中文字体和 Markdown 解析细节都封装在底层转换模块中
+            result = convert_md_to_pdf_via_word(md_abs_path, pdf_abs_path)
+            span.set_result(
+                artifact_type="pdf",
+                source_filename=md_abs_path.name,
+                artifact_filename=pdf_abs_path.name,
+                artifact_exists=pdf_abs_path.exists(),
+                artifact_size=pdf_abs_path.stat().st_size
+                if pdf_abs_path.exists()
+                else None,
+            )
+            return result
 
-    except Exception as e:
-        logging.error(f"转换失败: {e}", exc_info=True)
-        return f"转换失败: {str(e)}"
+        except Exception as e:
+            logging.error(f"转换失败: {e}", exc_info=True)
+            span.set_result(error_message=str(e))
+            return f"转换失败: {str(e)}"
 
 
 if __name__ == "__main__":

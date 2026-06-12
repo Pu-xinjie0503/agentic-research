@@ -12,7 +12,8 @@ from typing import Any, Optional
 
 from fastapi import WebSocket
 
-from app.api.context import get_thread_context
+from app.api.context import get_thread_context, get_trace_context
+from app.observability.tracing import get_current_span_id, record_event
 
 
 class ToolMonitor:
@@ -40,6 +41,7 @@ class ToolMonitor:
         event_type: str,
         message: str,
         data: Optional[dict[str, Any]] = None,
+        write_log: bool = True,
     ) -> None:
         """
         构造统一监控事件，并尝试推送到当前 thread_id 对应的前端连接
@@ -48,17 +50,32 @@ class ToolMonitor:
         :param message: 面向前端展示的事件说明
         :param data: 附加结构化数据
         """
+        thread_id = get_thread_context()
+        trace_id = get_trace_context()
+        span_id = get_current_span_id()
+        safe_data = data or {}
+
+        if write_log:
+            record_event(
+                event_name=event_type,
+                component="monitor",
+                message=message,
+                metadata=safe_data,
+            )
+
         payload = {
             "type": "monitor_event",
             "event": event_type,
             "message": message,
-            "data": data or {},
+            "data": safe_data,
             "timestamp": datetime.datetime.now().isoformat(),
+            "trace_id": trace_id,
+            "thread_id": thread_id,
+            "span_id": span_id,
         }
 
         if self.websocket_manager:
             try:
-                thread_id = get_thread_context()
                 manager_loop = self.websocket_manager.loop
 
                 if manager_loop and thread_id:

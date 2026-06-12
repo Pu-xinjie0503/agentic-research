@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from mysql.connector import Error, connect
 
 from app.api.monitor import monitor
+from app.observability.tracing import summarize_text, trace_span
 
 load_dotenv()
 
@@ -63,33 +64,44 @@ def list_sql_tables() -> str:
     # 埋点：工具一被调用，前端可以展示当前正在查询数据库表名
     monitor.report_tool(tool_name="数据库表名查询工具：list_sql_tables", args={})
 
-    # 加载数据库连接信息
-    config = get_db_config()
+    with trace_span(
+        "tool.list_sql_tables",
+        component="tool",
+        metadata={"tool_name": "list_sql_tables"},
+    ) as span:
+        # 加载数据库连接信息
+        config = get_db_config()
 
-    # MySQL 查询的固定步骤：
-    # 1. 创建连接
-    # 2. 创建 cursor
-    # 3. 执行 SQL
-    # 4. 获取返回结果
-    # 5. 释放连接和 cursor 资源
-    # 这里捕获异常并返回中文提示，避免工具报错直接中断 Agent 执行链路
-    try:
-        # 使用 with 管理连接和游标，查询结束后自动释放数据库资源
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
-                sql = "SHOW TABLES"
-                cursor.execute(sql)
+        # MySQL 查询的固定步骤：
+        # 1. 创建连接
+        # 2. 创建 cursor
+        # 3. 执行 SQL
+        # 4. 获取返回结果
+        # 5. 释放连接和 cursor 资源
+        # 这里捕获异常并返回中文提示，避免工具报错直接中断 Agent 执行链路
+        try:
+            # 使用 with 管理连接和游标，查询结束后自动释放数据库资源
+            with connect(**config) as conn:
+                with conn.cursor() as cursor:
+                    sql = "SHOW TABLES"
+                    cursor.execute(sql)
 
-                # SHOW TABLES 返回形如：[("drugs",), ("inventory",), ("sales_records",)]
-                tables = cursor.fetchall()
-                if not tables:
-                    return "没有可用的表"
+                    # SHOW TABLES 返回形如：[("drugs",), ("inventory",), ("sales_records",)]
+                    tables = cursor.fetchall()
+                    if not tables:
+                        span.set_result(table_count=0)
+                        return "没有可用的表"
 
-                # 取每个元组的第一个元素，拼成模型容易阅读的表名列表
-                table_names = [table[0] for table in tables]
-                return f"可用的表有：{', '.join(table_names)}"
-    except Error as e:
-        return f"查询出现异常：{str(e)}"
+                    # 取每个元组的第一个元素，拼成模型容易阅读的表名列表
+                    table_names = [table[0] for table in tables]
+                    span.set_result(
+                        table_count=len(table_names),
+                        table_names=table_names,
+                    )
+                    return f"可用的表有：{', '.join(table_names)}"
+        except Error as e:
+            span.set_result(error_message=str(e))
+            return f"查询出现异常：{str(e)}"
 
 
 @tool
@@ -119,44 +131,58 @@ def get_table_data(table_name) -> str:
         args={"table_name": table_name},
     )
 
-    # 获取数据库参数
-    config = get_db_config()
+    with trace_span(
+        "tool.get_table_data",
+        component="tool",
+        metadata={"tool_name": "get_table_data", "table_name": table_name},
+    ) as span:
+        # 获取数据库参数
+        config = get_db_config()
 
-    # 查询流程同样是：连接 -> cursor -> 执行 SQL -> 获取列信息和数据 -> 自动释放资源
-    try:
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
-                # 教程代码直接拼接表名，重点演示 Agent 查询链路；生产环境应改为白名单校验
-                sql = f"SELECT * FROM {table_name} LIMIT 100"
-                cursor.execute(sql)
+        # 查询流程同样是：连接 -> cursor -> 执行 SQL -> 获取列信息和数据 -> 自动释放资源
+        try:
+            with connect(**config) as conn:
+                with conn.cursor() as cursor:
+                    # 教程代码直接拼接表名，重点演示 Agent 查询链路；生产环境应改为白名单校验
+                    sql = f"SELECT * FROM {table_name} LIMIT 100"
+                    cursor.execute(sql)
 
-                # cursor.description 保存查询结果的列元信息
-                # 例如：[("id", ...), ("name", ...), ("age", ...)]
-                # 如果 SQL 没有结果集，description 可能为 None
-                description = cursor.description
-                if not description:
-                    return f"数据表 {table_name} 暂无数据。"
+                    # cursor.description 保存查询结果的列元信息
+                    # 例如：[("id", ...), ("name", ...), ("age", ...)]
+                    # 如果 SQL 没有结果集，description 可能为 None
+                    description = cursor.description
+                    if not description:
+                        span.set_result(row_count=0, result_summary="暂无数据")
+                        return f"数据表 {table_name} 暂无数据。"
 
-                # 只取每个列信息元组的第一个元素，也就是列名
-                # 例如：["id", "name", "age"]
-                columns = [desc[0] for desc in description]
+                    # 只取每个列信息元组的第一个元素，也就是列名
+                    # 例如：["id", "name", "age"]
+                    columns = [desc[0] for desc in description]
 
-                # fetchall 返回表数据，形如：[(1, "张三", 18), (2, "李四", 20)]
-                rows = cursor.fetchall()
+                    # fetchall 返回表数据，形如：[(1, "张三", 18), (2, "李四", 20)]
+                    rows = cursor.fetchall()
 
-                # 把每一行数据从元组转成 CSV 行文本
-                # 例如：(1, "张三", 18) -> "1,张三,18"
-                results = [",".join(map(str, row)) for row in rows]
+                    # 把每一行数据从元组转成 CSV 行文本
+                    # 例如：(1, "张三", 18) -> "1,张三,18"
+                    results = [",".join(map(str, row)) for row in rows]
 
-                # columns 组成 CSV 头部，rows 组成 CSV 数据体
-                # 最终返回：
-                # id,name,age
-                # 1,张三,18
-                header_str = ",".join(columns)
-                data_str = "\n".join(results)
-                return f"{header_str}\n{data_str}"
-    except Error as e:
-        return f"查询出现异常：{str(e)}"
+                    # columns 组成 CSV 头部，rows 组成 CSV 数据体
+                    # 最终返回：
+                    # id,name,age
+                    # 1,张三,18
+                    header_str = ",".join(columns)
+                    data_str = "\n".join(results)
+                    result = f"{header_str}\n{data_str}"
+                    span.set_result(
+                        row_count=len(rows),
+                        column_count=len(columns),
+                        columns=columns,
+                        result_summary=summarize_text(result),
+                    )
+                    return result
+        except Error as e:
+            span.set_result(error_message=str(e))
+            return f"查询出现异常：{str(e)}"
 
 
 @tool
@@ -182,36 +208,51 @@ def execute_sql_query(query) -> str:
         tool_name="数据库表数据查询工具：execute_sql_query", args={"query": query}
     )
 
-    # 获取数据库参数
-    config = get_db_config()
+    with trace_span(
+        "tool.execute_sql_query",
+        component="tool",
+        metadata={"tool_name": "execute_sql_query", "query": query},
+    ) as span:
+        # 获取数据库参数
+        config = get_db_config()
 
-    # 自定义查询和 get_table_data 的结果处理逻辑一致：
-    # 执行 SQL -> 读取 description 得到列名 -> fetchall 得到数据 -> 拼成 CSV 返回
-    try:
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
-                # 当前章节依赖提示词约束模型生成只读查询；生产环境建议在工具层限制 SELECT/SHOW
-                cursor.execute(query)
+        # 自定义查询和 get_table_data 的结果处理逻辑一致：
+        # 执行 SQL -> 读取 description 得到列名 -> fetchall 得到数据 -> 拼成 CSV 返回
+        try:
+            with connect(**config) as conn:
+                with conn.cursor() as cursor:
+                    # 当前章节依赖提示词约束模型生成只读查询；生产环境建议在工具层限制 SELECT/SHOW
+                    cursor.execute(query)
 
-                # 非查询类 SQL 没有结果集描述，这里统一返回提示，避免工具调用直接抛错给模型
-                description = cursor.description
-                if not description:
-                    return f"执行自定义 SQL 语句没有查询结果，SQL 为：{query}"
-                # description => [("列1", ...), ("列2", ...)]
-                columns = [desc[0] for desc in description]
+                    # 非查询类 SQL 没有结果集描述，这里统一返回提示，避免工具调用直接抛错给模型
+                    description = cursor.description
+                    if not description:
+                        result = f"执行自定义 SQL 语句没有查询结果，SQL 为：{query}"
+                        span.set_result(row_count=0, result_summary=summarize_text(result))
+                        return result
+                    # description => [("列1", ...), ("列2", ...)]
+                    columns = [desc[0] for desc in description]
 
-                # rows => [(值1, 值2), (值1, 值2)]
-                rows = cursor.fetchall()
+                    # rows => [(值1, 值2), (值1, 值2)]
+                    rows = cursor.fetchall()
 
-                # 每行元组统一转为逗号分隔文本，便于模型读取和后续整理
-                results = [",".join(map(str, row)) for row in rows]
+                    # 每行元组统一转为逗号分隔文本，便于模型读取和后续整理
+                    results = [",".join(map(str, row)) for row in rows]
 
-                # 第一行是列名，后续是查询数据
-                header_str = ",".join(columns)
-                data_str = "\n".join(results)
-                return f"{header_str}\n{data_str}"
-    except Error as e:
-        return f"查询出现异常：{str(e)}"
+                    # 第一行是列名，后续是查询数据
+                    header_str = ",".join(columns)
+                    data_str = "\n".join(results)
+                    result = f"{header_str}\n{data_str}"
+                    span.set_result(
+                        row_count=len(rows),
+                        column_count=len(columns),
+                        columns=columns,
+                        result_summary=summarize_text(result),
+                    )
+                    return result
+        except Error as e:
+            span.set_result(error_message=str(e))
+            return f"查询出现异常：{str(e)}"
 
 
 if __name__ == "__main__":

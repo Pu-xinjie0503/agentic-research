@@ -19,6 +19,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -28,7 +29,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.agent.main_agent import run_deep_agent
+from app.api.context import (
+    get_trace_context,
+    reset_trace_context,
+    set_trace_context,
+)
 from app.api.monitor import manager
+from app.observability.tracing import record_event, trace_span
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -71,6 +78,35 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def trace_http_requests(request: Request, call_next):
+    """
+    HTTP 请求级追踪中间件
+
+    它只覆盖接口入口耗时；真正的 Agent 后台执行耗时由 run_deep_agent 内部的
+    trace/span 继续记录。
+    """
+    trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
+    trace_token = set_trace_context(trace_id)
+
+    try:
+        with trace_span(
+            "http.request",
+            component="api",
+            metadata={
+                "method": request.method,
+                "path": request.url.path,
+            },
+        ) as span:
+            response = await call_next(request)
+            span.set_result(status_code=response.status_code)
+
+        response.headers["X-Trace-Id"] = trace_id
+        return response
+    finally:
+        reset_trace_context(trace_token)
+
+
 class TaskRequest(BaseModel):
     """前端启动任务时提交的请求体。"""
 
@@ -98,6 +134,14 @@ async def run_task(request: TaskRequest):
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
     """
     thread_id = request.thread_id or str(uuid.uuid4())
+    trace_id = get_trace_context() or str(uuid.uuid4())
+
+    record_event(
+        event_name="task_submitted",
+        component="api",
+        message="后台任务已提交",
+        metadata={"thread_id": thread_id, "query": request.query},
+    )
 
     # 同一个 thread_id 只保留一个活跃任务，新任务会先取消旧任务，避免并发写同一会话目录
     old_task = active_tasks.get(thread_id)
@@ -105,11 +149,11 @@ async def run_task(request: TaskRequest):
         old_task.cancel()
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(run_deep_agent(request.query, thread_id))
+    task = asyncio.create_task(run_deep_agent(request.query, thread_id, trace_id))
     active_tasks[thread_id] = task
     task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
 
-    return {"status": "started", "thread_id": thread_id}
+    return {"status": "started", "thread_id": thread_id, "trace_id": trace_id}
 
 
 @app.post("/api/task/{thread_id}/cancel")

@@ -126,7 +126,7 @@
 | 后端接口       | `FastAPI` / `Uvicorn`                            | 提供任务、取消、上传、文件列表、下载和 WebSocket 接口                         |
 | 实时通信       | `WebSocket`                                      | 推送工具调用、助手调用、最终结果和错误事件                                    |
 | 前端           | `React` / `Vite` / `Ant Design` / `Tailwind CSS` | 提供对话式研搜界面、事件流、附件上传和文件下载                                |
-| 依赖管理       | `uv` / `pnpm`                                    | 管理 Python 后端和前端依赖                                                    |
+| 依赖管理       | `uv` / `corepack pnpm`                           | 管理 Python 后端和前端依赖                                                    |
 
 ## 📁 项目结构
 
@@ -168,7 +168,7 @@ deepsearch-agents/
 - Python `3.12`
 - `uv`
 - Docker 与 Docker Compose
-- Node.js 与 `pnpm`
+- Node.js 与 Corepack；前端命令推荐使用 `corepack pnpm`
 - 可用的大模型 API Key
 - Tavily API Key
 
@@ -218,7 +218,7 @@ MYSQL_SQL_MODE=TRADITIONAL
 本仓库的 `docker/mysql/mysql.sql` 会在 MySQL 容器首次创建数据目录时自动导入药品、库存和销售记录模拟数据。
 
 ```bash
-docker compose -f docker/docker-compose.yaml up -d
+docker compose --env-file .env -f docker/docker-compose.yaml up -d
 ```
 
 ### 6. 启动后端
@@ -242,9 +242,11 @@ uv run uvicorn app.api.server:app --host 0.0.0.0 --port 8000 --reload
 
 ```bash
 cd frontend
-pnpm install
-pnpm dev
+corepack pnpm install
+corepack pnpm dev
 ```
+
+如果已经执行过 `corepack enable`，并且新终端里可以识别 `pnpm`，也可以直接使用 `pnpm install` 和 `pnpm dev`。如果 PowerShell 提示“无法将 pnpm 项识别为 cmdlet”，请使用上面的 `corepack pnpm ...` 写法。
 
 前端默认连接：
 
@@ -273,6 +275,48 @@ VITE_WS_BASE_URL=ws://localhost:8000
 ```text
 请先读取我上传的行业报告，再结合公开资料整理一份研究摘要。
 ```
+
+### 9. 查看日志与离线评测
+
+结构化 trace 日志默认保存在：
+
+```text
+app/logs/traces/YYYY-MM-DD.jsonl
+```
+
+离线评测只读取已有日志，不调用大模型、Tavily 或 MySQL：
+
+```bash
+uv run python app/evaluation/run_offline_evaluation.py
+```
+
+多能力性能基线默认包含网络、数据库、文件分析和组合交付任务。先使用
+`--dry-run` 查看 12 次平衡运行清单，此命令不会调用任何外部服务：
+
+```bash
+uv run python app/evaluation/run_baseline.py --dry-run
+```
+
+依赖预检会发送最小 DeepSeek/Tavily 请求并连接 MySQL，但不会执行正式基线：
+
+```bash
+uv run python app/evaluation/run_baseline.py --preflight-only
+```
+
+真实基线会消耗模型和搜索额度，确认后再执行：
+
+```bash
+uv run python app/evaluation/run_baseline.py
+```
+
+也可以只运行指定任务并覆盖重复次数：
+
+```bash
+uv run python app/evaluation/run_baseline.py --tasks database_query network_search --repeat 1
+```
+
+基线报告保存在 `app/logs/baselines/`，包含模型调用次数、分 Agent 耗时、
+token、工具墙钟耗时、搜索执行与拦截次数。
 
 ## 📚 配套教程目录
 
@@ -315,7 +359,7 @@ git checkout main
 - 文件上传安全扫描和内容审核；
 - 任务队列、分布式执行和大规模并发治理；
 - 全量事件持久化、历史会话恢复和审计追踪；
-- 系统化评测集、自动化回归和 Agent 质量评估；
+- 更大规模的线上评测集、持续回归和人工标注质量评估；
 - 生产监控、告警、链路追踪和灰度发布；
 - 复杂报告编辑、协同工作流和权限化文件管理。
 
