@@ -14,6 +14,7 @@ from fastapi import WebSocket
 
 from app.api.context import get_thread_context, get_trace_context
 from app.observability.tracing import get_current_span_id, record_event
+from app.utils.console import safe_console_print
 
 
 class ToolMonitor:
@@ -81,7 +82,7 @@ class ToolMonitor:
                 if manager_loop and thread_id:
                     self._send_to_websocket(payload, thread_id, manager_loop)
             except Exception as e:
-                print(f"[Monitor] WebSocket send failed: {e}")
+                safe_console_print(f"[Monitor] WebSocket send failed: {e}")
 
         # DeepAgents 脚本调试时，如果运行时暴露了 stream_writer，也同步写入流式输出
         if hasattr(builtins, "runtime") and hasattr(builtins.runtime, "stream_writer"):
@@ -91,7 +92,7 @@ class ToolMonitor:
                 pass
 
         # 控制台保底输出，便于无前端场景下观察执行过程
-        print(f"\n[Monitor:{event_type}] {message}")
+        safe_console_print(f"\n[Monitor:{event_type}] {message}")
 
     def _send_to_websocket(
         self,
@@ -172,21 +173,25 @@ class ConnectionManager:
         """绑定 FastAPI 主事件循环，并同步注册到 monitor"""
         self.loop = loop
         monitor.set_websocket_manager(self)
-        print(f"[Monitor] ConnectionManager manually bound to loop: {id(self.loop)}")
+        safe_console_print(
+            f"[Monitor] ConnectionManager manually bound to loop: {id(self.loop)}"
+        )
 
     async def connect(self, websocket: WebSocket, thread_id: str) -> None:
         """接受 WebSocket 连接，并按 thread_id 保存"""
         await websocket.accept()
         self.active_connections[thread_id] = websocket
-        print(f"Client connected: {thread_id}")
+        safe_console_print(f"Client connected: {thread_id}")
 
     def disconnect(self, websocket: WebSocket, thread_id: str) -> None:
         """移除已经断开的 WebSocket 连接"""
         if self.active_connections.get(thread_id) is websocket:
             del self.active_connections[thread_id]
-            print(f"Client disconnected: {thread_id}")
+            safe_console_print(f"Client disconnected: {thread_id}")
         else:
-            print(f"Stale websocket disconnected, current connection kept: {thread_id}")
+            safe_console_print(
+                f"Stale websocket disconnected, current connection kept: {thread_id}"
+            )
 
     async def send_personal_message(self, message: str, websocket: WebSocket) -> None:
         """向指定 WebSocket 发送纯文本消息"""

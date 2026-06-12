@@ -6,7 +6,7 @@ Tavily 网络搜索工具模块
 """
 
 import os
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -21,6 +21,43 @@ load_dotenv()
 
 # TavilyClient 是实际访问搜索服务的客户端；模块级复用可避免每次工具调用重复初始化
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+
+def _truncate_text(value: Any, limit: int) -> str:
+    """截断外部搜索文本，避免单次工具结果挤占过多上下文。"""
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def compact_search_result(raw_result: Any) -> dict[str, Any]:
+    """保留 Tavily 关键结构，并限制结果数量和正文长度。"""
+    source = dict(raw_result) if isinstance(raw_result, dict) else {"result": raw_result}
+    compact_results = []
+    for item in list(source.get("results") or [])[:5]:
+        if not isinstance(item, dict):
+            continue
+        compact_item = {
+            "title": _truncate_text(item.get("title"), 300),
+            "url": str(item.get("url") or ""),
+            "content": _truncate_text(item.get("content"), 1200),
+        }
+        if item.get("score") is not None:
+            compact_item["score"] = item["score"]
+        if item.get("published_date"):
+            compact_item["published_date"] = str(item["published_date"])
+        if item.get("raw_content"):
+            compact_item["raw_content"] = _truncate_text(item["raw_content"], 1200)
+        compact_results.append(compact_item)
+
+    result = {
+        "query": str(source.get("query") or ""),
+        "answer": _truncate_text(source.get("answer"), 2000),
+        "results": compact_results,
+    }
+    for key in ("response_time", "request_id"):
+        if source.get(key) is not None:
+            result[key] = source[key]
+    return result
 
 
 # @tool 会把函数签名和 docstring 暴露给 DeepAgents，模型据此决定是否调用以及如何填参
@@ -49,6 +86,7 @@ def internet_search(
     :param target_gap: 第 4、5 次补搜要解决的具体信息缺口
     :return: Tavily 返回的结构化搜索结果
     """
+    max_results = max(1, min(int(max_results), 5))
     search_state = get_search_run_state()
     reservation = (
         search_state.reserve(
@@ -133,11 +171,7 @@ def internet_search(
                 max_results=max_results,
                 include_raw_content=include_raw_content,
             )
-            result = (
-                dict(raw_result)
-                if isinstance(raw_result, dict)
-                else {"result": raw_result}
-            )
+            result = compact_search_result(raw_result)
             control = (
                 search_state.complete(reservation, result=result)
                 if search_state and reservation

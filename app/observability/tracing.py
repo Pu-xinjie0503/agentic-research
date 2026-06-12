@@ -42,6 +42,7 @@ class TraceState:
     trace_id: str
     thread_id: str
     task_query_summary: str
+    run_metadata: dict[str, Any]
     started_at: str
     started_perf: float
     spans: list[dict[str, Any]] = field(default_factory=list)
@@ -128,6 +129,7 @@ def begin_trace(
     trace_id: str,
     thread_id: str,
     task_query: str,
+    run_metadata: Optional[dict[str, Any]] = None,
 ) -> Token[Optional[TraceState]]:
     """
     创建任务级 trace 状态
@@ -141,6 +143,7 @@ def begin_trace(
         trace_id=trace_id,
         thread_id=thread_id,
         task_query_summary=summarize_text(task_query),
+        run_metadata=sanitize_for_log(run_metadata or {}),
         started_at=now_iso(),
         started_perf=time.perf_counter(),
     )
@@ -149,7 +152,10 @@ def begin_trace(
         event_name="trace_start",
         component="trace",
         message="任务链路开始",
-        metadata={"task_query_summary": state.task_query_summary},
+        metadata={
+            "task_query_summary": state.task_query_summary,
+            "run_metadata": state.run_metadata,
+        },
     )
     return token
 
@@ -334,11 +340,23 @@ def finish_trace(
     tool_calls: dict[str, int] = {}
     assistant_calls: dict[str, int] = {}
 
+    governed_assistant_events = [
+        event
+        for event in state.events
+        if event.get("event") == "agent_call_reserved"
+    ]
+
     for event in state.events:
         if event.get("event") == "tool_start":
             tool_name = event.get("metadata", {}).get("tool_name", "unknown")
             tool_calls[tool_name] = tool_calls.get(tool_name, 0) + 1
-        if event.get("event") == "assistant_call":
+        if governed_assistant_events and event.get("event") == "agent_call_reserved":
+            assistant_name = event.get("metadata", {}).get(
+                "subagent_type",
+                "unknown",
+            )
+            assistant_calls[assistant_name] = assistant_calls.get(assistant_name, 0) + 1
+        elif not governed_assistant_events and event.get("event") == "assistant_call":
             assistant_name = event.get("metadata", {}).get(
                 "assistant_name",
                 "unknown",
@@ -347,8 +365,12 @@ def finish_trace(
 
     # 延迟导入避免 tracing 与搜索状态模块形成初始化循环。
     from app.observability.search_state import get_search_snapshot
+    from app.observability.agent_state import get_agent_snapshot
+    from app.observability.database_state import get_database_snapshot
 
     search_summary = get_search_snapshot()
+    agent_summary = get_agent_snapshot()
+    database_summary = get_database_snapshot()
     model_summary = _build_model_summary(state.spans)
     performance_summary = _build_performance_summary(
         state.spans,
@@ -366,11 +388,14 @@ def finish_trace(
         "started_at": state.started_at,
         "total_duration_ms": total_duration_ms,
         "task_query_summary": state.task_query_summary,
+        "run_metadata": state.run_metadata,
         "span_count": len(state.spans),
         "event_count": len(state.events),
         "tool_calls": tool_calls,
         "assistant_calls": assistant_calls,
         "search": search_summary,
+        "agent_governance": agent_summary,
+        "database": database_summary,
         "model": model_summary,
         "performance": performance_summary,
         "spans": [

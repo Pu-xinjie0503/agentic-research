@@ -7,15 +7,99 @@ execute_sql_query 用于在确认结构后执行自定义查询。
 """
 
 import os
+import re
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from mysql.connector import Error, connect
 
 from app.api.monitor import monitor
+from app.observability.database_state import get_database_run_state
+from app.observability.tracing import record_event
 from app.observability.tracing import summarize_text, trace_span
 
 load_dotenv()
+
+
+READ_ONLY_PREFIXES = {"select", "show", "describe", "desc", "explain", "with"}
+FORBIDDEN_SQL_KEYWORDS = {
+    "alter",
+    "call",
+    "create",
+    "delete",
+    "drop",
+    "grant",
+    "insert",
+    "load",
+    "lock",
+    "replace",
+    "revoke",
+    "truncate",
+    "update",
+}
+
+
+def _strip_sql_literals_and_comments(query: str) -> str:
+    """去除字符串字面量和注释，供只读 SQL 关键字检查使用。"""
+    without_comments = re.sub(r"/\*.*?\*/", " ", query, flags=re.DOTALL)
+    without_comments = re.sub(r"--[^\r\n]*", " ", without_comments)
+    without_comments = re.sub(r"#[^\r\n]*", " ", without_comments)
+    return re.sub(
+        r"'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\"",
+        "''",
+        without_comments,
+        flags=re.DOTALL,
+    )
+
+
+def validate_read_only_query(query: str) -> tuple[bool, str]:
+    """验证 SQL 仅包含一条只读语句。"""
+    if not query or not query.strip():
+        return False, "SQL 不能为空。"
+    sanitized = _strip_sql_literals_and_comments(query).strip()
+    statements = [part.strip() for part in sanitized.split(";") if part.strip()]
+    if len(statements) != 1:
+        return False, "只允许执行一条 SQL 语句。"
+
+    tokens = re.findall(r"[a-zA-Z_]+", statements[0].lower())
+    if not tokens or tokens[0] not in READ_ONLY_PREFIXES:
+        return False, "只允许 SELECT、SHOW、DESCRIBE、EXPLAIN 或只读 WITH 查询。"
+    forbidden = sorted(set(tokens) & FORBIDDEN_SQL_KEYWORDS)
+    if forbidden:
+        return False, f"检测到非只读关键字：{', '.join(forbidden)}。"
+    if re.search(r"\binto\s+(outfile|dumpfile)\b", statements[0], flags=re.IGNORECASE):
+        return False, "禁止将查询结果写入服务器文件。"
+    if re.search(r"\bfor\s+update\b", statements[0], flags=re.IGNORECASE):
+        return False, "禁止使用 FOR UPDATE 锁定数据。"
+    return True, ""
+
+
+def _compact_rows(
+    columns: list[str],
+    rows: list[tuple],
+    max_chars: int,
+) -> tuple[str, bool]:
+    """把查询结果压缩为有界 CSV 文本。"""
+    lines = [",".join(columns)]
+    truncated = False
+    for row in rows:
+        line = ",".join("" if value is None else str(value) for value in row)
+        if sum(len(item) + 1 for item in lines) + len(line) > max_chars:
+            truncated = True
+            break
+        lines.append(line)
+    if truncated:
+        lines.append("...结果已按上下文上限截断...")
+    return "\n".join(lines), truncated
+
+
+def _load_table_names(config: dict) -> list[str]:
+    """读取真实表名，供列表工具和表名白名单复用。"""
+    with connect(**config) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SHOW TABLES")
+            return [str(table[0]) for table in cursor.fetchall()]
 
 
 # 集中读取数据库配置，后续三个工具都复用这份连接参数
@@ -61,6 +145,18 @@ def list_sql_tables() -> str:
              出现异常：查询出现异常：异常信息
     """
 
+    database_state = get_database_run_state()
+    if database_state and database_state.table_list_result is not None:
+        with database_state.lock:
+            database_state.cache_hit_count += 1
+        record_event(
+            event_name="database_cache_hit",
+            component="database_governance",
+            message="复用数据库表名缓存",
+            metadata={"cache_type": "table_list"},
+        )
+        return database_state.table_list_result
+
     # 埋点：工具一被调用，前端可以展示当前正在查询数据库表名
     monitor.report_tool(tool_name="数据库表名查询工具：list_sql_tables", args={})
 
@@ -80,34 +176,30 @@ def list_sql_tables() -> str:
         # 5. 释放连接和 cursor 资源
         # 这里捕获异常并返回中文提示，避免工具报错直接中断 Agent 执行链路
         try:
-            # 使用 with 管理连接和游标，查询结束后自动释放数据库资源
-            with connect(**config) as conn:
-                with conn.cursor() as cursor:
-                    sql = "SHOW TABLES"
-                    cursor.execute(sql)
+            table_names = _load_table_names(config)
+            if not table_names:
+                span.set_result(table_count=0)
+                return "没有可用的表"
 
-                    # SHOW TABLES 返回形如：[("drugs",), ("inventory",), ("sales_records",)]
-                    tables = cursor.fetchall()
-                    if not tables:
-                        span.set_result(table_count=0)
-                        return "没有可用的表"
-
-                    # 取每个元组的第一个元素，拼成模型容易阅读的表名列表
-                    table_names = [table[0] for table in tables]
-                    span.set_result(
-                        table_count=len(table_names),
-                        table_names=table_names,
-                    )
-                    return f"可用的表有：{', '.join(table_names)}"
+            result = f"可用的表有：{', '.join(table_names)}"
+            if database_state:
+                with database_state.lock:
+                    database_state.table_list_result = result
+                    database_state.table_names.update(table_names)
+            span.set_result(
+                table_count=len(table_names),
+                table_names=table_names,
+            )
+            return result
         except Error as e:
             span.set_result(error_message=str(e))
             return f"查询出现异常：{str(e)}"
 
 
 @tool
-def get_table_data(table_name) -> str:
+def get_table_data(table_name: str, row_limit: int = 20) -> str:
     """
-    查询指定表的前 100 行数据
+    查询指定表的前若干行数据
 
     当前工具调用之前，应先调用 list_sql_tables 完成表名校验。
     此工具的作用：
@@ -118,23 +210,43 @@ def get_table_data(table_name) -> str:
              1. 第一行是列信息，列之间使用英文逗号分隔
              2. 第二行开始是表数据，值之间也使用英文逗号分隔
              3. 行和行之间使用 \n 分隔
-             4. 至多查询 100 条表数据
+             4. 默认查询 20 条，最多查询 50 条表数据
              例如：
                 id,name,age\n -> 列头
                 1,张三,18\n
                 1,张三,18\n
-                1,张三,18\n -> 至多查询 100 条
+                1,张三,18\n
     """
+    row_limit = max(1, min(int(row_limit), 50))
+    database_state = get_database_run_state()
+    if database_state:
+        with database_state.lock:
+            cached = database_state.table_previews.get(table_name)
+            if cached is not None:
+                database_state.cache_hit_count += 1
+        if cached is not None:
+            record_event(
+                event_name="database_cache_hit",
+                component="database_governance",
+                message=f"复用 {table_name} 表预览缓存",
+                metadata={"cache_type": "table_preview", "table_name": table_name},
+            )
+            return cached
+
     # 埋点：工具二被调用，前端可以展示当前正在预览哪张表
     monitor.report_tool(
         tool_name="数据库表数据查询工具：get_table_data",
-        args={"table_name": table_name},
+        args={"table_name": table_name, "row_limit": row_limit},
     )
 
     with trace_span(
         "tool.get_table_data",
         component="tool",
-        metadata={"tool_name": "get_table_data", "table_name": table_name},
+        metadata={
+            "tool_name": "get_table_data",
+            "table_name": table_name,
+            "row_limit": row_limit,
+        },
     ) as span:
         # 获取数据库参数
         config = get_db_config()
@@ -143,8 +255,17 @@ def get_table_data(table_name) -> str:
         try:
             with connect(**config) as conn:
                 with conn.cursor() as cursor:
-                    # 教程代码直接拼接表名，重点演示 Agent 查询链路；生产环境应改为白名单校验
-                    sql = f"SELECT * FROM {table_name} LIMIT 100"
+                    if database_state and database_state.table_names:
+                        with database_state.lock:
+                            table_names = set(database_state.table_names)
+                    else:
+                        cursor.execute("SHOW TABLES")
+                        table_names = {
+                            str(table[0]) for table in cursor.fetchall()
+                        }
+                    if table_name not in table_names:
+                        return f"错误：数据表 {table_name} 不存在或不允许访问。"
+                    sql = f"SELECT * FROM `{table_name}` LIMIT {row_limit}"
                     cursor.execute(sql)
 
                     # cursor.description 保存查询结果的列元信息
@@ -160,23 +281,19 @@ def get_table_data(table_name) -> str:
                     columns = [desc[0] for desc in description]
 
                     # fetchall 返回表数据，形如：[(1, "张三", 18), (2, "李四", 20)]
-                    rows = cursor.fetchall()
-
-                    # 把每一行数据从元组转成 CSV 行文本
-                    # 例如：(1, "张三", 18) -> "1,张三,18"
-                    results = [",".join(map(str, row)) for row in rows]
-
-                    # columns 组成 CSV 头部，rows 组成 CSV 数据体
-                    # 最终返回：
-                    # id,name,age
-                    # 1,张三,18
-                    header_str = ",".join(columns)
-                    data_str = "\n".join(results)
-                    result = f"{header_str}\n{data_str}"
+                    rows = cursor.fetchmany(row_limit)
+                    result, truncated = _compact_rows(columns, rows, max_chars=8000)
+                    if database_state:
+                        with database_state.lock:
+                            database_state.table_previews[table_name] = result
+                            database_state.table_names.update(table_names)
+                            if truncated:
+                                database_state.truncated_result_count += 1
                     span.set_result(
                         row_count=len(rows),
                         column_count=len(columns),
                         columns=columns,
+                        truncated=truncated,
                         result_summary=summarize_text(result),
                     )
                     return result
@@ -186,7 +303,13 @@ def get_table_data(table_name) -> str:
 
 
 @tool
-def execute_sql_query(query) -> str:
+def execute_sql_query(
+    query: str,
+    continuation_reason: Optional[
+        Literal["evidence_gap", "query_correction", "result_validation"]
+    ] = None,
+    target_gap: str = "",
+) -> str:
     """
     执行自定义 SQL 查询
 
@@ -203,15 +326,83 @@ def execute_sql_query(query) -> str:
                 1,张三,18\n
                 1,张三,18\n
     """
+    valid, validation_error = validate_read_only_query(query)
+    if not valid:
+        record_event(
+            event_name="database_query_blocked",
+            component="database_governance",
+            message=validation_error,
+            status="warning",
+            metadata={"blocked_reason": "read_only_validation"},
+        )
+        return f"SQL 已拒绝执行：{validation_error}"
+
+    database_state = get_database_run_state()
+    reservation = (
+        database_state.reserve_query(
+            query,
+            continuation_reason=continuation_reason,
+            target_gap=target_gap,
+        )
+        if database_state
+        else None
+    )
+    if reservation is not None and not reservation.allowed:
+        if reservation.cached_result is not None:
+            record_event(
+                event_name="database_cache_hit",
+                component="database_governance",
+                message=reservation.message,
+                metadata={"cache_type": "sql_result"},
+            )
+            return reservation.cached_result
+        record_event(
+            event_name="database_query_blocked",
+            component="database_governance",
+            message=reservation.message,
+            status="warning",
+            metadata={
+                "blocked_reason": reservation.blocked_reason,
+                "remaining_budget": database_state.snapshot()["remaining_budget"],
+            },
+        )
+        return (
+            f"SQL 已拒绝执行：{reservation.message}"
+            " 请使用已有查询结果完成回答，不要继续重复查询。"
+        )
+
+    if reservation is not None:
+        record_event(
+            event_name="database_query_reserved",
+            component="database_governance",
+            message=f"已预留第 {reservation.call_index} 次 SQL 查询",
+            metadata={
+                "call_index": reservation.call_index,
+                "is_extension": reservation.is_extension,
+                "continuation_reason": reservation.continuation_reason,
+                "target_gap": summarize_text(reservation.target_gap),
+            },
+        )
+
     # 埋点：记录模型最终生成的 SQL，便于教学时观察是否真的落到了正确表字段上
     monitor.report_tool(
-        tool_name="数据库表数据查询工具：execute_sql_query", args={"query": query}
+        tool_name="数据库表数据查询工具：execute_sql_query",
+        args={
+            "query": query,
+            "continuation_reason": continuation_reason,
+            "target_gap": target_gap,
+        },
     )
 
     with trace_span(
         "tool.execute_sql_query",
         component="tool",
-        metadata={"tool_name": "execute_sql_query", "query": query},
+        metadata={
+            "tool_name": "execute_sql_query",
+            "query": query,
+            "continuation_reason": continuation_reason,
+            "target_gap": target_gap,
+        },
     ) as span:
         # 获取数据库参数
         config = get_db_config()
@@ -228,29 +419,59 @@ def execute_sql_query(query) -> str:
                     description = cursor.description
                     if not description:
                         result = f"执行自定义 SQL 语句没有查询结果，SQL 为：{query}"
+                        if database_state and reservation:
+                            database_state.complete_query(
+                                reservation,
+                                result=result,
+                            )
                         span.set_result(row_count=0, result_summary=summarize_text(result))
                         return result
                     # description => [("列1", ...), ("列2", ...)]
                     columns = [desc[0] for desc in description]
 
                     # rows => [(值1, 值2), (值1, 值2)]
-                    rows = cursor.fetchall()
-
-                    # 每行元组统一转为逗号分隔文本，便于模型读取和后续整理
-                    results = [",".join(map(str, row)) for row in rows]
-
-                    # 第一行是列名，后续是查询数据
-                    header_str = ",".join(columns)
-                    data_str = "\n".join(results)
-                    result = f"{header_str}\n{data_str}"
+                    rows = cursor.fetchmany(101)
+                    row_limit_truncated = len(rows) > 100
+                    rows = rows[:100]
+                    result, char_limit_truncated = _compact_rows(
+                        columns,
+                        rows,
+                        max_chars=12000,
+                    )
+                    truncated = row_limit_truncated or char_limit_truncated
+                    if row_limit_truncated and not result.endswith(
+                        "...结果已按上下文上限截断..."
+                    ):
+                        result += "\n...结果已限制为前 100 行..."
+                    if database_state and reservation:
+                        database_state.complete_query(
+                            reservation,
+                            result=result,
+                            truncated=truncated,
+                        )
                     span.set_result(
                         row_count=len(rows),
                         column_count=len(columns),
                         columns=columns,
+                        truncated=truncated,
                         result_summary=summarize_text(result),
                     )
+                    record_event(
+                        event_name="database_query_completed",
+                        component="database_governance",
+                        message="SQL 查询执行完成",
+                        metadata={
+                            "call_index": (
+                                reservation.call_index if reservation else None
+                            ),
+                            "row_count": len(rows),
+                            "truncated": truncated,
+                        },
+                    )
                     return result
-        except Error as e:
+        except Exception as e:
+            if database_state and reservation:
+                database_state.complete_query(reservation, error=e)
             span.set_result(error_message=str(e))
             return f"查询出现异常：{str(e)}"
 

@@ -50,8 +50,16 @@ class SearchGovernanceMiddleware(AgentMiddleware):
 4. 当前决策为 stop 时，禁止继续调用 internet_search，应基于已有证据完成总结并说明局限。
 """
         current_prompt = request.system_message.text if request.system_message else ""
+        tools = list(request.tools or [])
+        if snapshot["decision"] == "stop":
+            tools = [
+                tool
+                for tool in tools
+                if getattr(tool, "name", None) != "internet_search"
+            ]
         return request.override(
             system_message=SystemMessage(
                 content=current_prompt + governance_prompt,
-            )
+            ),
+            tools=tools,
         )

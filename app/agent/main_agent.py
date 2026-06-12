@@ -9,13 +9,21 @@ session_id 创建独立工作目录，并把工具调用、子智能体调用和
 import asyncio
 import shutil
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from deepagents import create_deep_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.llm import model
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
+from app.agent.middleware.agent_governance import AgentGovernanceMiddleware
+from app.agent.middleware.final_response_governance import (
+    FinalResponseGovernanceMiddleware,
+)
+from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
 from app.agent.prompts import main_agent_content
 from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.file_analysis_agent import file_analysis_agent
@@ -42,10 +50,23 @@ from app.observability.search_state import (
     finalize_search_run,
     reset_search_run,
 )
+from app.observability.agent_state import (
+    begin_agent_run,
+    configure_agent_run,
+    finalize_agent_run,
+    infer_allowed_subagents,
+    reset_agent_run,
+)
+from app.observability.database_state import (
+    begin_database_run,
+    finalize_database_run,
+    reset_database_run,
+)
 
 # 交付类工具由主智能体直接掌握，负责生成最终 Markdown/PDF 文档
 from app.tools.markdown_tools import generate_markdown
 from app.tools.pdf_tools import convert_md_to_pdf
+from app.utils.console import safe_console_print
 
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件生成工具
@@ -55,7 +76,15 @@ main_agent = create_deep_agent(
     model=model,
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf],
-    middleware=[ModelTracingMiddleware("主智能体")],
+    middleware=[
+        ToolAllowlistMiddleware(
+            {"task", "generate_markdown", "convert_md_to_pdf"}
+        ),
+        AgentGovernanceMiddleware(),
+        FinalResponseGovernanceMiddleware(),
+        ModelTracingMiddleware("主智能体"),
+        ModelCallLimitMiddleware(run_limit=14, exit_behavior="error"),
+    ],
     checkpointer=InMemorySaver(),
     subagents=[database_query_agent, network_search_agent, file_analysis_agent],
 )
@@ -64,7 +93,37 @@ main_agent = create_deep_agent(
 project_root_path = Path(__file__).parents[1].resolve()
 
 
-async def run_deep_agent(task_query, session_id, trace_id=None):
+@dataclass(frozen=True)
+class AgentRunResult:
+    """一次 Agent 执行的结构化返回值。"""
+
+    trace_summary: dict[str, Any] | None
+    final_result: str
+    artifacts: list[dict[str, Any]]
+
+
+def _collect_artifacts(session_dir: Path | None) -> list[dict[str, Any]]:
+    """收集当前会话实际生成的文件元数据。"""
+    if session_dir is None or not session_dir.exists():
+        return []
+    return [
+        {
+            "filename": path.name,
+            "path": str(path),
+            "suffix": path.suffix.lower(),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(session_dir.rglob("*"))
+        if path.is_file()
+    ]
+
+
+async def run_deep_agent(
+    task_query,
+    session_id,
+    trace_id=None,
+    run_metadata: dict[str, Any] | None = None,
+) -> AgentRunResult:
     """
     异步流式执行主智能体
 
@@ -77,14 +136,25 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
     trace_id = trace_id or str(uuid.uuid4())
     trace_token = set_trace_context(trace_id)
     session_id_token = set_thread_context(session_id)
-    trace_state_token = begin_trace(trace_id, session_id, task_query)
+    trace_state_token = begin_trace(
+        trace_id,
+        session_id,
+        task_query,
+        run_metadata=run_metadata,
+    )
     search_state_token = begin_search_run(trace_id)
+    agent_state_token = begin_agent_run(trace_id)
+    database_state_token = begin_database_run(trace_id)
     session_dir_token = None
     final_status = "success"
     final_error = None
     trace_summary = None
+    final_result = ""
+    session_dir: Path | None = None
 
-    print(f"[MainAgent] 开始执行会话，session_id={session_id}, trace_id={trace_id}")
+    safe_console_print(
+        f"[MainAgent] 开始执行会话，session_id={session_id}, trace_id={trace_id}"
+    )
 
     try:
         with trace_span(
@@ -128,6 +198,12 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
                 uploaded_files=uploaded_files,
             )
 
+        allowed_subagents = infer_allowed_subagents(
+            str(task_query),
+            has_uploaded_files=bool(uploaded_files),
+        )
+        configure_agent_run(allowed_subagents)
+
         # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
         session_dir_token = set_session_context(session_dir_str)
 
@@ -148,6 +224,7 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
         2. 读取已上传的文件时，请调用文件分析助手，并要求它直接将文件名（例如：'开篇.txt'）作为 filename 参数传入读取工具，不要带上任何目录前缀。
         3. 使用相对路径，禁止使用绝对路径
         4. 若存在上传文件，请先分析内容
+        5. 本次允许调用的专家仅限：{', '.join(sorted(allowed_subagents)) or '无'}。不得调用列表之外的专家。
         """
 
         with trace_span(
@@ -160,8 +237,6 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
         ) as agent_span:
             chunk_count = 0
             assistant_calls = []
-            final_result = ""
-
             # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
             async for chunk in main_agent.astream(
                 {
@@ -199,11 +274,11 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
                                         )
                             elif last_msg.content:
                                 # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                                final_result = last_msg.content
-                                print(
-                                    f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
+                                final_result = last_msg.text or str(last_msg.content)
+                                safe_console_print(
+                                    f"主智能体执行结果，最终结果：{final_result[:100]}"
                                 )
-                                monitor.report_task_result(last_msg.content)
+                                monitor.report_task_result(final_result)
 
             agent_span.set_result(
                 chunk_count=chunk_count,
@@ -227,6 +302,8 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
             "cancelled": "task_cancelled",
         }[final_status]
         search_summary = finalize_search_run(search_stop_reason)
+        finalize_agent_run(search_stop_reason)
+        finalize_database_run(search_stop_reason)
         if search_summary:
             record_event(
                 event_name="search_stop",
@@ -246,11 +323,17 @@ async def run_deep_agent(task_query, session_id, trace_id=None):
         if session_dir_token is not None:
             reset_session_context(session_dir_token)
         reset_search_run(search_state_token)
+        reset_database_run(database_state_token)
+        reset_agent_run(agent_state_token)
         reset_trace_state(trace_state_token)
         reset_thread_context(session_id_token)
         reset_trace_context(trace_token)
 
-    return trace_summary
+    return AgentRunResult(
+        trace_summary=trace_summary,
+        final_result=final_result,
+        artifacts=_collect_artifacts(session_dir),
+    )
 
 
 if __name__ == "__main__":

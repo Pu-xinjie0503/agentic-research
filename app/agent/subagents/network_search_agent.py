@@ -9,6 +9,8 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 from app.agent.prompts import sub_agents_content
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.search_governance import SearchGovernanceMiddleware
+from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from app.tools.tavily_tool import internet_search
 
 # 字典式子智能体的核心字段来自 YAML，便于后续只改配置就能调整路由描述和行为约束
@@ -19,7 +21,9 @@ network_search_agent = {
     "system_prompt": sub_agents_content["tavily"]["system_prompt"],
     "tools": [internet_search],
     "middleware": [
-        ModelTracingMiddleware("网络搜索助手"),
+        ToolAllowlistMiddleware({"internet_search"}),
         SearchGovernanceMiddleware(),
+        ModelTracingMiddleware("网络搜索助手"),
+        ModelCallLimitMiddleware(run_limit=10, exit_behavior="error"),
     ],
 }

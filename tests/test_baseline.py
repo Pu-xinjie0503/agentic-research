@@ -7,6 +7,7 @@ import unittest
 from app.evaluation.baseline import (
     BASELINE_CASES,
     DEFAULT_FIXTURE,
+    _aggregate_case,
     build_run_plan,
 )
 
@@ -45,6 +46,26 @@ class BaselinePlanTests(unittest.TestCase):
 
     def test_fixture_exists(self) -> None:
         self.assertTrue(DEFAULT_FIXTURE.is_file())
+
+    def test_quality_judge_none_does_not_break_aggregation(self) -> None:
+        summary = _aggregate_case(
+            [
+                {
+                    "passed": True,
+                    "performance": {},
+                    "model": {},
+                    "search": {},
+                    "quality": {"rule_score": 1.0, "dimensions": {"routing": 1.0}},
+                    "quality_judge": None,
+                }
+            ]
+        )
+
+        self.assertIsNone(summary["judge_overall_score"])
+        self.assertEqual(
+            summary["quality_dimensions"]["routing"]["average"],
+            1.0,
+        )
 
 
 if __name__ == "__main__":

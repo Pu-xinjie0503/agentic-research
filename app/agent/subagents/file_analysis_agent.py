@@ -8,6 +8,8 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 
 from app.agent.prompts import sub_agents_content
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
+from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from app.tools.upload_file_read_tool import read_file_content
 
 # 文件分析助手只负责读取和分析当前会话工作目录中的上传附件
@@ -17,5 +19,9 @@ file_analysis_agent = {
     "description": sub_agents_content["file_analysis"]["description"],
     "system_prompt": sub_agents_content["file_analysis"]["system_prompt"],
     "tools": [read_file_content],
-    "middleware": [ModelTracingMiddleware("文件分析助手")],
+    "middleware": [
+        ToolAllowlistMiddleware({"read_file_content"}),
+        ModelTracingMiddleware("文件分析助手"),
+        ModelCallLimitMiddleware(run_limit=6, exit_behavior="error"),
+    ],
 }

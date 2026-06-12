@@ -67,6 +67,19 @@ class TraceView:
         return "unknown"
 
     @property
+    def run_metadata(self) -> dict[str, Any]:
+        """读取基线或评测运行写入的明确身份信息。"""
+        if self.summary and isinstance(self.summary.get("run_metadata"), dict):
+            return dict(self.summary["run_metadata"])
+        for record in self.records:
+            if record.get("event") == "trace_start":
+                metadata = record.get("metadata") or {}
+                value = metadata.get("run_metadata")
+                if isinstance(value, dict):
+                    return dict(value)
+        return {}
+
+    @property
     def duration_ms(self) -> float | None:
         if self.summary and self.summary.get("total_duration_ms") is not None:
             return float(self.summary["total_duration_ms"])
@@ -307,6 +320,20 @@ def matches_keywords(trace: TraceView, keywords: list[str]) -> bool:
 
 def choose_trace_for_task(task: dict[str, Any], traces: dict[str, TraceView]) -> TraceView | None:
     """为任务选择最新的匹配 trace。"""
+    explicit_trace_id = task.get("trace_id")
+    if explicit_trace_id:
+        return traces.get(str(explicit_trace_id))
+
+    task_id = str(task.get("id") or "")
+    identified = [
+        trace
+        for trace in traces.values()
+        if trace.summary is not None
+        and trace.run_metadata.get("evaluation_task_id") == task_id
+    ]
+    if identified:
+        return sorted(identified, key=lambda item: item.timestamp)[-1]
+
     keywords = task.get("match_keywords") or []
     candidates = [
         trace

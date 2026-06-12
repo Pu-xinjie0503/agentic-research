@@ -38,6 +38,9 @@ class BaselineCase:
     requires_database: bool = False
     requires_file: bool = False
     expected_artifacts: tuple[str, ...] = ()
+    evaluation_task_id: str = ""
+    expected_assistants: tuple[str, ...] = ()
+    forbidden_assistants: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,7 @@ class BaselineRun:
     trace_id: str
     requires_file: bool
     expected_artifacts: tuple[str, ...]
+    evaluation_task_id: str
 
 
 BASELINE_CASES: dict[str, BaselineCase] = {
@@ -62,6 +66,9 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         query="请检索 2026 年跨境电商 AI 客服趋势，列出 5 条关键变化并附来源链接，不生成文件。",
         default_repeats=3,
         requires_web=True,
+        evaluation_task_id="network_search_trends",
+        expected_assistants=("网络搜索助手",),
+        forbidden_assistants=("数据库查询助手", "文件分析助手"),
     ),
     "database_query": BaselineCase(
         case_id="database_query",
@@ -69,6 +76,9 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         query="请查询当前数据库中库存数量最低的 5 个药品，按库存从低到高输出表格，不调用网络搜索，不生成文件。",
         default_repeats=3,
         requires_database=True,
+        evaluation_task_id="database_low_stock",
+        expected_assistants=("数据库查询助手",),
+        forbidden_assistants=("网络搜索助手", "文件分析助手"),
     ),
     "file_analysis": BaselineCase(
         case_id="file_analysis",
@@ -76,6 +86,9 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         query="请读取我上传的药品经营简报，提取核心观点、需要数据库核验的数据、风险点和信息缺口，不调用网络搜索，不生成文件。",
         default_repeats=3,
         requires_file=True,
+        evaluation_task_id="file_analysis_summary",
+        expected_assistants=("文件分析助手",),
+        forbidden_assistants=("网络搜索助手", "数据库查询助手"),
     ),
     "multi_agent": BaselineCase(
         case_id="multi_agent",
@@ -85,6 +98,12 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         requires_web=True,
         requires_database=True,
         requires_file=True,
+        evaluation_task_id="multi_agent_research",
+        expected_assistants=(
+            "文件分析助手",
+            "数据库查询助手",
+            "网络搜索助手",
+        ),
     ),
     "markdown_delivery": BaselineCase(
         case_id="markdown_delivery",
@@ -94,6 +113,9 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         requires_web=True,
         requires_database=True,
         expected_artifacts=("markdown",),
+        evaluation_task_id="markdown_report_generation",
+        expected_assistants=("数据库查询助手", "网络搜索助手"),
+        forbidden_assistants=("文件分析助手",),
     ),
     "pdf_delivery": BaselineCase(
         case_id="pdf_delivery",
@@ -103,6 +125,9 @@ BASELINE_CASES: dict[str, BaselineCase] = {
         requires_web=True,
         requires_file=True,
         expected_artifacts=("markdown", "pdf"),
+        evaluation_task_id="pdf_delivery_generation",
+        expected_assistants=("文件分析助手", "网络搜索助手"),
+        forbidden_assistants=("数据库查询助手",),
     ),
 }
 
@@ -145,6 +170,7 @@ def build_run_plan(
                     trace_id=str(uuid.uuid4()),
                     requires_file=case.requires_file,
                     expected_artifacts=case.expected_artifacts,
+                    evaluation_task_id=case.evaluation_task_id,
                 )
             )
     return runs
@@ -243,6 +269,7 @@ async def execute_baseline(
     runs: list[BaselineRun],
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     fixture_path: Path = DEFAULT_FIXTURE,
+    quality_judge: bool = False,
 ) -> dict[str, Any]:
     """预检通过后执行运行清单并生成 JSON/Markdown 报告。"""
     selected_cases = list(dict.fromkeys(run.case_id for run in runs))
@@ -266,7 +293,14 @@ async def execute_baseline(
     results: list[dict[str, Any]] = []
     for run in runs:
         try:
-            results.append(await _execute_run(run, fixture_path))
+            results.append(
+                await _execute_run(
+                    run,
+                    fixture_path,
+                    output_dir,
+                    quality_judge=quality_judge,
+                )
+            )
         except Exception as exc:
             results.append(
                 {
@@ -297,6 +331,8 @@ async def execute_baseline(
 async def _execute_run(
     run: BaselineRun,
     fixture_path: Path,
+    output_dir: Path,
+    quality_judge: bool = False,
 ) -> dict[str, Any]:
     """执行单条任务并提取性能指标。"""
     from app.agent.main_agent import run_deep_agent
@@ -307,18 +343,87 @@ async def _execute_run(
         shutil.copy2(fixture_path, staging_dir / fixture_path.name)
 
     try:
-        summary = await run_deep_agent(
+        agent_result = await run_deep_agent(
             run.query,
             run.thread_id,
             run.trace_id,
+            run_metadata={
+                "run_id": run.run_id,
+                "case_id": run.case_id,
+                "evaluation_task_id": run.evaluation_task_id,
+            },
         )
     finally:
         if staging_dir.exists():
             shutil.rmtree(staging_dir)
 
-    summary = summary or {}
+    summary = agent_result.trace_summary or {}
+    return await _build_run_result(
+        run=run,
+        summary=summary,
+        final_result=agent_result.final_result,
+        output_dir=output_dir,
+        quality_judge=quality_judge,
+    )
+
+
+async def _build_run_result(
+    run: BaselineRun,
+    summary: dict[str, Any],
+    final_result: str,
+    output_dir: Path,
+    quality_judge: bool,
+) -> dict[str, Any]:
+    """根据已落盘的 trace 和答案构造单次基线结果。"""
+    from app.evaluation.quality import (
+        evaluate_routing_quality,
+        evaluate_rule_quality,
+        load_low_stock_truth,
+        run_sampled_quality_judge,
+    )
+
+    answer_dir = output_dir / "answers"
+    answer_dir.mkdir(parents=True, exist_ok=True)
+    answer_path = answer_dir / f"{run.run_id}.md"
+    answer_path.write_text(final_result, encoding="utf-8")
     output_path = APP_ROOT / "output" / f"session_{run.thread_id}"
     artifact_status = _artifact_status(output_path, run.expected_artifacts)
+    low_stock_truth = (
+        await asyncio.to_thread(load_low_stock_truth)
+        if run.case_id in {"database_query", "markdown_delivery"}
+        else None
+    )
+    quality = evaluate_rule_quality(
+        case_id=run.case_id,
+        final_result=final_result,
+        output_path=output_path,
+        expected_artifacts=run.expected_artifacts,
+        low_stock_truth=low_stock_truth,
+    )
+    case = BASELINE_CASES[run.case_id]
+    routing = evaluate_routing_quality(
+        summary.get("assistant_calls") or {},
+        case.expected_assistants,
+        case.forbidden_assistants,
+    )
+    quality["routing"] = routing
+    quality["dimensions"]["routing"] = routing["score"]
+    quality["rule_score"] = round(
+        sum(quality["dimensions"].values()) / len(quality["dimensions"]),
+        4,
+    )
+    judge = None
+    if quality_judge and run.iteration == 1:
+        quality_content = _quality_content(
+            final_result,
+            output_path,
+            run.expected_artifacts,
+        )
+        judge = await run_sampled_quality_judge(
+            run.case_id,
+            run.query,
+            quality_content,
+        )
     return {
         **asdict(run),
         "status": summary.get("status", "missing_summary"),
@@ -331,8 +436,87 @@ async def _execute_run(
         "search": summary.get("search") or {},
         "tool_calls": summary.get("tool_calls") or {},
         "assistant_calls": summary.get("assistant_calls") or {},
+        "agent_governance": summary.get("agent_governance") or {},
+        "database": summary.get("database") or {},
         "artifacts": artifact_status,
+        "answer_path": str(answer_path),
+        "final_result_length": len(final_result),
+        "quality": quality,
+        "quality_judge": judge,
     }
+
+
+async def recover_baseline_report(
+    manifest_path: Path,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    quality_judge: bool = False,
+) -> dict[str, Any]:
+    """从已完成任务的 manifest、trace 和答案恢复基线报告。"""
+    from app.evaluation.evaluator import DEFAULT_TRACE_DIR, load_traces
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    runs = [BaselineRun(**item) for item in manifest.get("runs", [])]
+    traces = load_traces(DEFAULT_TRACE_DIR, date=None)
+    results: list[dict[str, Any]] = []
+
+    for run in runs:
+        trace = traces.get(run.trace_id)
+        answer_path = output_dir / "answers" / f"{run.run_id}.md"
+        if trace is None or trace.summary is None or not answer_path.is_file():
+            results.append(
+                {
+                    **asdict(run),
+                    "status": "recovery_error",
+                    "passed": False,
+                    "error": "缺少 trace_summary 或答案文件，无法恢复该次运行。",
+                    "performance": {},
+                    "model": {},
+                    "search": {},
+                    "tool_calls": {},
+                    "assistant_calls": {},
+                    "artifacts": {},
+                    "quality": {},
+                    "quality_judge": None,
+                }
+            )
+            continue
+        final_result = answer_path.read_text(encoding="utf-8")
+        results.append(
+            await _build_run_result(
+                run=run,
+                summary=trace.summary,
+                final_result=final_result,
+                output_dir=output_dir,
+                quality_judge=quality_judge,
+            )
+        )
+
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "manifest": str(manifest_path),
+        "recovered": True,
+        "preflight": manifest.get("preflight") or [],
+        "summary": _aggregate_results(results),
+        "results": results,
+    }
+    _write_baseline_report(report, output_dir)
+    return report
+
+
+def _quality_content(
+    final_result: str,
+    output_path: Path,
+    expected_artifacts: tuple[str, ...],
+) -> str:
+    """优先使用 Markdown 产物正文作为质量评测输入。"""
+    if expected_artifacts and output_path.exists():
+        markdown_files = sorted(output_path.glob("*.md"))
+        if markdown_files:
+            try:
+                return markdown_files[-1].read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                pass
+    return final_result
 
 
 def _check_database() -> None:
@@ -431,6 +615,48 @@ def _aggregate_case(results: list[dict[str, Any]]) -> dict[str, Any]:
             agent_name: _number_stats(values)
             for agent_name, values in by_agent.items()
         },
+        "rule_quality_score": _number_stats(
+            [
+                float(item.get("quality", {}).get("rule_score"))
+                for item in results
+                if item.get("quality", {}).get("rule_score") is not None
+            ]
+        )
+        if any(
+            item.get("quality", {}).get("rule_score") is not None
+            for item in results
+        )
+        else None,
+        "judge_overall_score": _number_stats(
+            [
+                float((item.get("quality_judge") or {}).get("overall"))
+                for item in results
+                if (item.get("quality_judge") or {}).get("status") == "success"
+                and (item.get("quality_judge") or {}).get("overall") is not None
+            ]
+        )
+        if any(
+            (item.get("quality_judge") or {}).get("status") == "success"
+            and (item.get("quality_judge") or {}).get("overall") is not None
+            for item in results
+        )
+        else None,
+        "quality_dimensions": _aggregate_quality_dimensions(results),
+    }
+
+
+def _aggregate_quality_dimensions(
+    results: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """分别聚合路由、数据、引用、产物和内容质量。"""
+    values: dict[str, list[float]] = {}
+    for item in results:
+        dimensions = item.get("quality", {}).get("dimensions") or {}
+        for name, value in dimensions.items():
+            values.setdefault(str(name), []).append(float(value))
+    return {
+        name: _number_stats(dimension_values)
+        for name, dimension_values in values.items()
     }
 
 
@@ -502,6 +728,28 @@ def _render_markdown(report: dict[str, Any]) -> str:
                     if tokens
                     else "- Token：供应商未返回"
                 ),
+                (
+                    f"- 规则质量分：平均 {summary['rule_quality_score']['average']:.3f}"
+                    if summary.get("rule_quality_score")
+                    else "- 规则质量分：无适用指标"
+                ),
+                (
+                    f"- 抽样模型裁判：平均 {summary['judge_overall_score']['average']:.2f}/5"
+                    if summary.get("judge_overall_score")
+                    else "- 抽样模型裁判：未执行"
+                ),
+                (
+                    "- 分维度质量："
+                    + "，".join(
+                        f"{name}={metrics['average']:.3f}"
+                        for name, metrics in summary.get(
+                            "quality_dimensions",
+                            {},
+                        ).items()
+                    )
+                    if summary.get("quality_dimensions")
+                    else "- 分维度质量：无适用指标"
+                ),
                 "",
             ]
         )
@@ -532,6 +780,11 @@ def parse_args() -> argparse.Namespace:
         help="只运行指定任务；不传时使用全部平衡基线任务",
     )
     parser.add_argument(
+        "--quality-judge",
+        action="store_true",
+        help="对网络、组合和 PDF 案例的首轮结果执行抽样模型裁判",
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=None,
@@ -547,6 +800,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只执行依赖预检，不运行任务",
     )
+    parser.add_argument(
+        "--resume-manifest",
+        type=Path,
+        default=None,
+        help="从已完成运行的 manifest、trace 和答案恢复报告，不重复执行 Agent",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     return parser.parse_args()
@@ -554,6 +813,16 @@ def parse_args() -> argparse.Namespace:
 
 async def async_main(args: argparse.Namespace) -> int:
     """基线脚本异步入口。"""
+    if args.resume_manifest:
+        report = await recover_baseline_report(
+            args.resume_manifest,
+            args.output_dir,
+            quality_judge=args.quality_judge,
+        )
+        print(f"基线报告恢复完成，共处理 {len(report['results'])} 次运行。")
+        print(f"报告目录：{args.output_dir}")
+        return 0
+
     runs = build_run_plan(args.tasks, args.repeat)
     if args.dry_run:
         print(
@@ -574,7 +843,12 @@ async def async_main(args: argparse.Namespace) -> int:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
         return 0
 
-    report = await execute_baseline(runs, args.output_dir, args.fixture)
+    report = await execute_baseline(
+        runs,
+        args.output_dir,
+        args.fixture,
+        quality_judge=args.quality_judge,
+    )
     print(f"基线完成，共执行 {len(report['results'])} 次。")
     print(f"报告目录：{args.output_dir}")
     return 0
