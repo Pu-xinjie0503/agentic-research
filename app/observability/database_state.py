@@ -61,6 +61,8 @@ class DatabaseRunState:
     reserved_count: int = 0
     executed_count: int = 0
     blocked_count: int = 0
+    post_block_attempt_count: int = 0
+    post_stop_attempt_count: int = 0
     cache_hit_count: int = 0
     in_flight_count: int = 0
     extension_in_flight: bool = False
@@ -85,6 +87,10 @@ class DatabaseRunState:
         normalized = normalize_sql(query)
         with self.lock:
             self.attempted_count += 1
+            if self.blocked_count > 0:
+                self.post_block_attempt_count += 1
+            if self.stop_reason:
+                self.post_stop_attempt_count += 1
             if normalized in self.query_results:
                 self.cache_hit_count += 1
                 return DatabaseQueryReservation(
@@ -177,6 +183,8 @@ class DatabaseRunState:
                 "reserved_count": self.reserved_count,
                 "executed_count": self.executed_count,
                 "blocked_count": self.blocked_count,
+                "post_block_attempt_count": self.post_block_attempt_count,
+                "post_stop_attempt_count": self.post_stop_attempt_count,
                 "cache_hit_count": self.cache_hit_count,
                 "in_flight_count": self.in_flight_count,
                 "previewed_table_count": len(self.table_previews),

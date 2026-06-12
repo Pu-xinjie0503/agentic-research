@@ -7,10 +7,12 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 """
 
 from app.agent.prompts import sub_agents_content
+from app.agent.handoff import AgentHandoff, HANDOFF_ERROR_MESSAGE
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.search_governance import SearchGovernanceMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
 from langchain.agents.middleware import ModelCallLimitMiddleware
+from langchain.agents.structured_output import ToolStrategy
 from app.tools.tavily_tool import internet_search
 
 # 字典式子智能体的核心字段来自 YAML，便于后续只改配置就能调整路由描述和行为约束
@@ -19,6 +21,10 @@ network_search_agent = {
     "name": sub_agents_content["tavily"]["name"],
     "description": sub_agents_content["tavily"]["description"],
     "system_prompt": sub_agents_content["tavily"]["system_prompt"],
+    "response_format": ToolStrategy(
+        schema=AgentHandoff,
+        handle_errors=HANDOFF_ERROR_MESSAGE,
+    ),
     "tools": [internet_search],
     "middleware": [
         ToolAllowlistMiddleware({"internet_search"}),

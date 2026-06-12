@@ -31,10 +31,23 @@ class SearchGovernanceMiddleware(AgentMiddleware):
         if snapshot is None:
             return request
 
+        extension_rule = (
+            f"3. 第 {snapshot['soft_limit'] + 1} 至 "
+            f"{snapshot['hard_limit']} 次搜索必须传 "
+            "continuation_reason 和 target_gap。"
+            if snapshot["hard_limit"] > snapshot["soft_limit"]
+            else (
+                "3. 本任务不开放软预算后的补搜；达到硬预算后，"
+                "下一条输出必须直接提交 AgentHandoff，禁止再次生成 "
+                "internet_search 调用。"
+            )
+        )
         governance_prompt = f"""
 
 【搜索治理状态】
 - 当前阶段：{snapshot['phase']}
+- 软预算：{snapshot['soft_limit']} 次
+- 硬预算：{snapshot['hard_limit']} 次
 - 已实际执行：{snapshot['executed_count']} 次
 - 已拦截：{snapshot['blocked_count']} 次
 - 已发现独立来源域名：{snapshot['unique_domain_count']} 个
@@ -44,10 +57,10 @@ class SearchGovernanceMiddleware(AgentMiddleware):
 - 停止原因：{snapshot['stop_reason'] or '无'}
 
 决策规则：
-1. 前 3 次搜索应覆盖互补角度，禁止仅做同义词改写。
+1. 前 {snapshot['soft_limit']} 次搜索应覆盖互补角度，禁止仅做同义词改写。
 2. 当前决策为 review_required 时，先检查证据缺口；只有证据不足、来源单一或信息冲突才允许定向补搜。
-3. 第 4、5 次搜索必须传 continuation_reason 和 target_gap。
-4. 当前决策为 stop 时，禁止继续调用 internet_search，应基于已有证据完成总结并说明局限。
+{extension_rule}
+4. 当前决策为 stop 时，下一条输出必须直接提交 AgentHandoff；禁止继续调用 internet_search，应基于已有证据完成总结并说明局限。
 """
         current_prompt = request.system_message.text if request.system_message else ""
         tools = list(request.tools or [])

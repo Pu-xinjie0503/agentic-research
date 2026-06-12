@@ -223,29 +223,37 @@ def _read_artifact_content(
         return "", {}
     checks: dict[str, bool] = {}
     markdown_text = ""
-    markdown_files = sorted(output_path.glob("*.md")) if output_path.exists() else []
-    pdf_files = sorted(output_path.glob("*.pdf")) if output_path.exists() else []
+    markdown_files = list(output_path.glob("*.md")) if output_path.exists() else []
+    pdf_files = list(output_path.glob("*.pdf")) if output_path.exists() else []
 
     if "markdown" in expected_artifacts:
         try:
-            markdown_text = markdown_files[-1].read_text(encoding="utf-8")
+            markdown_text = _latest_file(markdown_files).read_text(encoding="utf-8")
             checks["markdown"] = len(markdown_text.strip()) >= 200
-        except (IndexError, OSError, UnicodeError):
+        except (ValueError, OSError, UnicodeError):
             checks["markdown"] = False
 
     if "pdf" in expected_artifacts:
         try:
             import pypdf
 
-            reader = pypdf.PdfReader(str(pdf_files[-1]))
+            reader = pypdf.PdfReader(str(_latest_file(pdf_files)))
             pdf_text = "\n".join(page.extract_text() or "" for page in reader.pages)
             checks["pdf"] = bool(reader.pages) and len(pdf_text.strip()) >= 100
             if not markdown_text:
                 markdown_text = pdf_text
-        except (IndexError, OSError, ValueError):
+        except (OSError, ValueError):
             checks["pdf"] = False
 
     return markdown_text, checks
+
+
+def _latest_file(paths: list[Path]) -> Path:
+    """按修改时间选择本次生成的最新产物，避免误读上传附件。"""
+    return max(
+        paths,
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+    )
 
 
 def _extract_urls(content: str) -> list[str]:

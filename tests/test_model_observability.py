@@ -237,11 +237,62 @@ class TraceModelSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary["model"]["call_count"], 2)
         self.assertEqual(summary["model"]["total_tokens"], 45)
+        self.assertEqual(
+            [call["call_index"] for call in summary["model"]["calls"]],
+            [1, 2],
+        )
         self.assertEqual(summary["model"]["by_agent"]["主智能体"]["call_count"], 1)
         self.assertEqual(
             summary["model"]["by_agent"]["数据库查询助手"]["total_tokens"],
             30,
         )
+
+    def test_trace_summary_calculates_context_growth(self) -> None:
+        from app.observability import tracing
+
+        spans = [
+            {
+                "component": "model",
+                "span_name": "model.call",
+                "status": "success",
+                "duration_ms": 10,
+                "metadata": {
+                    "agent_name": "主智能体",
+                    "call_index": 2,
+                    "input_message_count": 4,
+                    "input_char_count": 300,
+                },
+                "result": {
+                    "input_tokens": 150,
+                    "output_tokens": 10,
+                    "total_tokens": 160,
+                },
+            },
+            {
+                "component": "model",
+                "span_name": "model.call",
+                "status": "success",
+                "duration_ms": 10,
+                "metadata": {
+                    "agent_name": "主智能体",
+                    "call_index": 1,
+                    "input_message_count": 2,
+                    "input_char_count": 100,
+                },
+                "result": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60,
+                },
+            },
+        ]
+
+        summary = tracing._build_model_summary(spans)
+
+        self.assertEqual(summary["first_input_tokens"], 50)
+        self.assertEqual(summary["last_input_tokens"], 150)
+        self.assertEqual(summary["max_input_char_count"], 300)
+        self.assertEqual(summary["input_token_growth_rate"], 2.0)
 
 
 class PerformanceIntervalTests(unittest.TestCase):

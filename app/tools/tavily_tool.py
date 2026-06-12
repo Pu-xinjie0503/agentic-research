@@ -39,19 +39,19 @@ def compact_search_result(raw_result: Any) -> dict[str, Any]:
         compact_item = {
             "title": _truncate_text(item.get("title"), 300),
             "url": str(item.get("url") or ""),
-            "content": _truncate_text(item.get("content"), 1200),
+            "content": _truncate_text(item.get("content"), 600),
         }
         if item.get("score") is not None:
             compact_item["score"] = item["score"]
         if item.get("published_date"):
             compact_item["published_date"] = str(item["published_date"])
         if item.get("raw_content"):
-            compact_item["raw_content"] = _truncate_text(item["raw_content"], 1200)
+            compact_item["raw_content"] = _truncate_text(item["raw_content"], 600)
         compact_results.append(compact_item)
 
     result = {
         "query": str(source.get("query") or ""),
-        "answer": _truncate_text(source.get("answer"), 2000),
+        "answer": _truncate_text(source.get("answer"), 1000),
         "results": compact_results,
     }
     for key in ("response_time", "request_id"):

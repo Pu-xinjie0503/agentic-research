@@ -47,6 +47,7 @@ from app.observability.tracing import (
 )
 from app.observability.search_state import (
     begin_search_run,
+    configure_search_run,
     finalize_search_run,
     reset_search_run,
 )
@@ -54,7 +55,7 @@ from app.observability.agent_state import (
     begin_agent_run,
     configure_agent_run,
     finalize_agent_run,
-    infer_allowed_subagents,
+    infer_task_scope,
     reset_agent_run,
 )
 from app.observability.database_state import (
@@ -198,11 +199,20 @@ async def run_deep_agent(
                 uploaded_files=uploaded_files,
             )
 
-        allowed_subagents = infer_allowed_subagents(
+        task_scope = infer_task_scope(
             str(task_query),
             has_uploaded_files=bool(uploaded_files),
         )
+        allowed_subagents = set(task_scope.allowed_subagents)
         configure_agent_run(allowed_subagents)
+        if task_scope.artifact_type or len(allowed_subagents) > 1:
+            configure_search_run(hard_limit=3)
+        record_event(
+            event_name="task_scope_inferred",
+            component="agent_governance",
+            message="已推断本次任务的能力范围",
+            metadata=task_scope.snapshot(),
+        )
 
         # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
         session_dir_token = set_session_context(session_dir_str)
@@ -214,6 +224,13 @@ async def run_deep_agent(
         config = {"configurable": {"thread_id": session_id}}
 
         # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
+        evidence_policy = (
+            "本次属于多源组合或文档交付任务。外部趋势只保留可核验的"
+            "定性结论、政策变化和技术方向；禁止写入第三方市场规模、"
+            "CAGR、预测金额，以及没有权威来源支撑的人口等精确数字。"
+            if task_scope.artifact_type or len(allowed_subagents) > 1
+            else "按用户任务保留必要事实，并确保精确数字可由来源 URL 核验。"
+        )
         path_instruction = f"""
         【工作环境指令】
         工作目录: {relative_session_dir_str}
@@ -225,6 +242,7 @@ async def run_deep_agent(
         3. 使用相对路径，禁止使用绝对路径
         4. 若存在上传文件，请先分析内容
         5. 本次允许调用的专家仅限：{', '.join(sorted(allowed_subagents)) or '无'}。不得调用列表之外的专家。
+        6. 证据策略：{evidence_policy}
         """
 
         with trace_span(

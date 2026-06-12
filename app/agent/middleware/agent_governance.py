@@ -9,6 +9,10 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import SystemMessage, ToolMessage
 
 from app.observability.agent_state import get_agent_run_state, get_agent_snapshot
+from app.observability.search_state import (
+    get_search_evidence_urls,
+    get_search_snapshot,
+)
 from app.observability.tracing import record_event, summarize_text
 
 
@@ -64,6 +68,7 @@ class AgentGovernanceMiddleware(AgentMiddleware):
             self._record_completed(reservation, error=exc)
             raise
         state.complete(reservation)
+        self._stop_after_search_budget(reservation, state)
         self._record_completed(reservation)
         return result
 
@@ -102,8 +107,18 @@ class AgentGovernanceMiddleware(AgentMiddleware):
             AgentGovernanceMiddleware._record_completed(reservation, error=exc)
             raise
         state.complete(reservation)
+        AgentGovernanceMiddleware._stop_after_search_budget(reservation, state)
         AgentGovernanceMiddleware._record_completed(reservation)
         return result
+
+    @staticmethod
+    def _stop_after_search_budget(reservation, state) -> None:
+        """搜索预算耗尽且任务范围已覆盖后，关闭后续专家调度。"""
+        if reservation.subagent_type != "网络搜索助手":
+            return
+        search_snapshot = get_search_snapshot()
+        if search_snapshot and search_snapshot.get("decision") == "stop":
+            state.stop_if_scope_covered("search_budget_exhausted")
 
     @staticmethod
     def _inject_state(request: ModelRequest) -> ModelRequest:
@@ -130,13 +145,46 @@ class AgentGovernanceMiddleware(AgentMiddleware):
 5. 文件、数据库、网络存在依赖时按顺序执行；只有互不依赖的任务才并行。
 """
         current_prompt = request.system_message.text if request.system_message else ""
-        tools = list(request.tools or [])
+        evidence_urls = get_search_evidence_urls()
+        evidence_prompt = (
+            "\n【已验证的网络来源 URL 兜底】\n"
+            + "\n".join(f"- {url}" for url in evidence_urls)
+            + "\n结构化交接遗漏链接时，只能从以上真实 URL 中补回引用。\n"
+            if evidence_urls
+            else ""
+        )
+        tools = [
+            AgentGovernanceMiddleware._scope_task_tool(
+                tool,
+                snapshot["allowed_subagents"],
+            )
+            for tool in request.tools or []
+        ]
         if snapshot["decision"] == "stop":
             tools = [tool for tool in tools if getattr(tool, "name", None) != "task"]
         return request.override(
-            system_message=SystemMessage(content=current_prompt + governance_prompt),
+            system_message=SystemMessage(
+                content=current_prompt + governance_prompt + evidence_prompt
+            ),
             tools=tools,
         )
+
+    @staticmethod
+    def _scope_task_tool(tool, allowed_subagents: list[str]):
+        """重写 task 工具描述，只暴露当前任务允许调用的专家。"""
+        if getattr(tool, "name", None) != "task":
+            return tool
+        available = "、".join(allowed_subagents) or "无"
+        description = (
+            "调用一个当前任务允许的专家子智能体。"
+            f"可用 subagent_type 仅限：{available}。"
+            "description 必须明确写出任务目标、输入和预期返回内容。"
+            "同一轮模型响应最多生成一个 task 调用，禁止并行调用同一专家。"
+        )
+        model_copy = getattr(tool, "model_copy", None)
+        if callable(model_copy):
+            return model_copy(update={"description": description})
+        return tool
 
     @staticmethod
     def _record_reserved(reservation, request: ToolCallRequest) -> None:

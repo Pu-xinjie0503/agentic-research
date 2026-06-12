@@ -197,7 +197,7 @@ def list_sql_tables() -> str:
 
 
 @tool
-def get_table_data(table_name: str, row_limit: int = 20) -> str:
+def get_table_data(table_name: str, row_limit: int = 8) -> str:
     """
     查询指定表的前若干行数据
 
@@ -206,6 +206,7 @@ def get_table_data(table_name: str, row_limit: int = 20) -> str:
     1. 完成单表样例数据查询
     2. 为多表查询提供表结构信息和数据格式参考
     :param table_name: 表名
+    默认预览 8 行，最多查询 50 行；返回内容还受字符上限保护。
     :return: CSV 格式数据
              1. 第一行是列信息，列之间使用英文逗号分隔
              2. 第二行开始是表数据，值之间也使用英文逗号分隔
@@ -282,7 +283,7 @@ def get_table_data(table_name: str, row_limit: int = 20) -> str:
 
                     # fetchall 返回表数据，形如：[(1, "张三", 18), (2, "李四", 20)]
                     rows = cursor.fetchmany(row_limit)
-                    result, truncated = _compact_rows(columns, rows, max_chars=8000)
+                    result, truncated = _compact_rows(columns, rows, max_chars=4000)
                     if database_state:
                         with database_state.lock:
                             database_state.table_previews[table_name] = result
@@ -430,19 +431,19 @@ def execute_sql_query(
                     columns = [desc[0] for desc in description]
 
                     # rows => [(值1, 值2), (值1, 值2)]
-                    rows = cursor.fetchmany(101)
-                    row_limit_truncated = len(rows) > 100
-                    rows = rows[:100]
+                    rows = cursor.fetchmany(51)
+                    row_limit_truncated = len(rows) > 50
+                    rows = rows[:50]
                     result, char_limit_truncated = _compact_rows(
                         columns,
                         rows,
-                        max_chars=12000,
+                        max_chars=6000,
                     )
                     truncated = row_limit_truncated or char_limit_truncated
                     if row_limit_truncated and not result.endswith(
                         "...结果已按上下文上限截断..."
                     ):
-                        result += "\n...结果已限制为前 100 行..."
+                        result += "\n...结果已限制为前 50 行..."
                     if database_state and reservation:
                         database_state.complete_query(
                             reservation,

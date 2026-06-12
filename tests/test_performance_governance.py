@@ -19,9 +19,10 @@ from app.agent.middleware.final_response_governance import (
 from app.observability.agent_state import (
     AgentRunState,
     infer_allowed_subagents,
+    infer_task_scope,
 )
 from app.observability.database_state import DatabaseRunState
-from app.tools.db_tools import validate_read_only_query
+from app.tools.db_tools import _compact_rows, validate_read_only_query
 from app.tools.tavily_tool import compact_search_result
 from app.utils.console import safe_console_print
 
@@ -30,7 +31,12 @@ class AgentGovernanceTests(unittest.TestCase):
     """验证专家默认一次和有理由补充一次。"""
 
     def test_second_call_requires_explicit_gap(self) -> None:
-        state = AgentRunState("trace-agent", soft_limit=3, hard_limit=5)
+        state = AgentRunState(
+            "trace-agent",
+            soft_limit=3,
+            hard_limit=5,
+            allowed_subagents={"网络搜索助手"},
+        )
 
         first = state.reserve("网络搜索助手", "查询公开资料")
         state.complete(first)
@@ -44,11 +50,48 @@ class AgentGovernanceTests(unittest.TestCase):
         self.assertTrue(first.allowed)
         self.assertFalse(blocked.allowed)
         self.assertEqual(blocked.blocked_reason, "missing_supplement_context")
+        self.assertEqual(state.snapshot()["decision"], "stop")
+        self.assertFalse(supplement.allowed)
+        self.assertEqual(supplement.blocked_reason, "blocked_repetition")
+
+    def test_repetition_does_not_stop_missing_required_agent(self) -> None:
+        state = AgentRunState(
+            "trace-agent",
+            soft_limit=3,
+            hard_limit=5,
+            allowed_subagents={"数据库查询助手", "网络搜索助手"},
+        )
+        database_call = state.reserve("数据库查询助手", "查询库存")
+        state.complete(database_call)
+
+        duplicate = state.reserve("数据库查询助手", "重复查询库存")
+        network_call = state.reserve("网络搜索助手", "查询公开趋势")
+
+        self.assertFalse(duplicate.allowed)
+        self.assertEqual(state.snapshot()["decision"], "continue_allowed")
+        self.assertTrue(network_call.allowed)
+
+    def test_explicit_supplement_is_allowed_without_prior_block(self) -> None:
+        state = AgentRunState("trace-agent", soft_limit=3, hard_limit=5)
+        first = state.reserve("网络搜索助手", "查询公开资料")
+        state.complete(first)
+
+        supplement = state.reserve(
+            "网络搜索助手",
+            "补齐证据 [continuation_reason=evidence_gap]"
+            "[target_gap=缺少监管机构来源]",
+        )
+
         self.assertTrue(supplement.allowed)
         self.assertTrue(supplement.is_supplement)
 
     def test_each_agent_has_at_most_two_calls(self) -> None:
-        state = AgentRunState("trace-agent", soft_limit=3, hard_limit=5)
+        state = AgentRunState(
+            "trace-agent",
+            soft_limit=3,
+            hard_limit=5,
+            allowed_subagents={"数据库查询助手"},
+        )
         first = state.reserve("数据库查询助手", "首次查询")
         state.complete(first)
         second = state.reserve(
@@ -65,6 +108,22 @@ class AgentGovernanceTests(unittest.TestCase):
 
         self.assertFalse(third.allowed)
         self.assertEqual(third.blocked_reason, "agent_call_limit")
+        self.assertEqual(state.snapshot()["decision"], "stop")
+
+    def test_scope_covered_can_stop_further_dispatch(self) -> None:
+        state = AgentRunState(
+            "trace-agent",
+            soft_limit=3,
+            hard_limit=5,
+            allowed_subagents={"文件分析助手", "网络搜索助手"},
+        )
+        file_call = state.reserve("文件分析助手", "读取附件")
+        network_call = state.reserve("网络搜索助手", "查询趋势")
+
+        self.assertTrue(file_call.allowed)
+        self.assertTrue(network_call.allowed)
+        self.assertTrue(state.stop_if_scope_covered("search_budget_exhausted"))
+        self.assertEqual(state.snapshot()["decision"], "stop")
 
     def test_unknown_or_out_of_scope_agent_is_blocked(self) -> None:
         state = AgentRunState(
@@ -102,6 +161,39 @@ class AgentGovernanceTests(unittest.TestCase):
             ),
             {"数据库查询助手"},
         )
+
+    def test_explicit_network_denial_overrides_keyword_match(self) -> None:
+        scope = infer_task_scope(
+            "查询数据库中的库存，不调用网络搜索，不生成文件",
+            has_uploaded_files=False,
+        )
+
+        self.assertEqual(scope.allowed_subagents, {"数据库查询助手"})
+        self.assertEqual(scope.forbidden_subagents, {"网络搜索助手"})
+        self.assertIsNone(scope.artifact_type)
+
+    def test_do_not_only_search_is_not_a_network_denial(self) -> None:
+        scope = infer_task_scope(
+            "不要只调用网络搜索，还要结合数据库库存生成 Markdown 报告",
+            has_uploaded_files=False,
+        )
+
+        self.assertEqual(
+            scope.allowed_subagents,
+            {"网络搜索助手", "数据库查询助手"},
+        )
+        self.assertEqual(scope.forbidden_subagents, set())
+        self.assertEqual(scope.artifact_type, "markdown")
+
+    def test_uploaded_file_can_be_explicitly_disabled(self) -> None:
+        scope = infer_task_scope(
+            "无需分析附件，只查询数据库库存并生成 PDF",
+            has_uploaded_files=True,
+        )
+
+        self.assertEqual(scope.allowed_subagents, {"数据库查询助手"})
+        self.assertIn("文件分析助手", scope.forbidden_subagents)
+        self.assertEqual(scope.artifact_type, "pdf")
 
 
 class DatabaseGovernanceTests(unittest.TestCase):
@@ -191,8 +283,19 @@ class ResultCompactionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(compacted["results"]), 5)
-        self.assertLessEqual(len(compacted["answer"]), 2014)
-        self.assertLessEqual(len(compacted["results"][0]["content"]), 1214)
+        self.assertLessEqual(len(compacted["answer"]), 1014)
+        self.assertLessEqual(len(compacted["results"][0]["content"]), 614)
+
+    def test_database_rows_are_compacted_by_character_budget(self) -> None:
+        result, truncated = _compact_rows(
+            ["id", "description"],
+            [(1, "a" * 100), (2, "b" * 100)],
+            max_chars=80,
+        )
+
+        self.assertTrue(truncated)
+        self.assertIn("结果已按上下文上限截断", result)
+        self.assertNotIn("a" * 100, result)
 
 
 class ToolAllowlistTests(unittest.TestCase):

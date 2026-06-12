@@ -510,10 +510,14 @@ def _quality_content(
 ) -> str:
     """优先使用 Markdown 产物正文作为质量评测输入。"""
     if expected_artifacts and output_path.exists():
-        markdown_files = sorted(output_path.glob("*.md"))
+        markdown_files = list(output_path.glob("*.md"))
         if markdown_files:
             try:
-                return markdown_files[-1].read_text(encoding="utf-8")
+                latest = max(
+                    markdown_files,
+                    key=lambda path: (path.stat().st_mtime_ns, path.name),
+                )
+                return latest.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 pass
     return final_result
@@ -611,6 +615,33 @@ def _aggregate_case(results: list[dict[str, Any]]) -> dict[str, Any]:
                 for item in results
             ]
         ),
+        "search_post_block_attempt_count": _number_stats(
+            [
+                int(item["search"].get("post_block_attempt_count") or 0)
+                for item in results
+            ]
+        ),
+        "agent_post_block_attempt_count": _number_stats(
+            [
+                int(
+                    item.get("agent_governance", {}).get(
+                        "post_block_attempt_count"
+                    )
+                    or 0
+                )
+                for item in results
+            ]
+        ),
+        "database_post_block_attempt_count": _number_stats(
+            [
+                int(
+                    item.get("database", {}).get("post_block_attempt_count")
+                    or 0
+                )
+                for item in results
+            ]
+        ),
+        "model_context": _aggregate_model_context(results),
         "agent_duration_ms": {
             agent_name: _number_stats(values)
             for agent_name, values in by_agent.items()
@@ -642,6 +673,36 @@ def _aggregate_case(results: list[dict[str, Any]]) -> dict[str, Any]:
         )
         else None,
         "quality_dimensions": _aggregate_quality_dimensions(results),
+    }
+
+
+def _aggregate_model_context(
+    results: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """按 Agent 聚合最大输入规模和上下文增长率。"""
+    values: dict[str, dict[str, list[float]]] = {}
+    for item in results:
+        for agent_name, metrics in (item["model"].get("by_agent") or {}).items():
+            target = values.setdefault(
+                agent_name,
+                {
+                    "max_input_tokens": [],
+                    "input_token_growth_rate": [],
+                    "max_input_char_count": [],
+                    "input_char_growth_rate": [],
+                },
+            )
+            for key in target:
+                value = metrics.get(key)
+                if isinstance(value, (int, float)):
+                    target[key].append(float(value))
+
+    return {
+        agent_name: {
+            key: _number_stats(metric_values) if metric_values else None
+            for key, metric_values in metrics.items()
+        }
+        for agent_name, metrics in values.items()
     }
 
 
@@ -722,6 +783,10 @@ def _render_markdown(report: dict[str, Any]) -> str:
                 f"- 模型调用：平均 {summary['model_call_count']['average']:.2f} 次",
                 f"- 搜索调用：平均执行 {summary['search_executed_count']['average']:.2f} 次，"
                 f"平均拦截 {summary['search_blocked_count']['average']:.2f} 次",
+                "- 拦截后继续尝试："
+                f"搜索 {summary['search_post_block_attempt_count']['average']:.2f} 次，"
+                f"专家 {summary['agent_post_block_attempt_count']['average']:.2f} 次，"
+                f"数据库 {summary['database_post_block_attempt_count']['average']:.2f} 次",
                 (
                     f"- Token：平均 {tokens['average']:.2f}，"
                     f"中位数 {tokens['median']:.2f}"
@@ -765,6 +830,27 @@ def _render_markdown(report: dict[str, Any]) -> str:
                 f"- {agent_name}：平均 {metrics['average'] / 1000:.2f}s，"
                 f"中位数 {metrics['median'] / 1000:.2f}s"
             )
+        lines.append("")
+
+    lines.extend(["## 分 Agent 上下文增长", ""])
+    for case_id, summary in report["summary"].items():
+        lines.append(f"### {case_id}")
+        context_metrics = summary.get("model_context") or {}
+        if not context_metrics:
+            lines.append("- 无上下文统计")
+        for agent_name, metrics in context_metrics.items():
+            max_tokens = metrics.get("max_input_tokens")
+            token_growth = metrics.get("input_token_growth_rate")
+            lines.append(
+                f"- {agent_name}：最大输入 Token "
+                f"{max_tokens['average']:.2f}"
+                if max_tokens
+                else f"- {agent_name}：最大输入 Token 未返回"
+            )
+            if token_growth:
+                lines.append(
+                    f"  输入 Token 增长率均值 {token_growth['average']:.2%}"
+                )
         lines.append("")
     return "\n".join(lines)
 

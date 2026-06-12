@@ -118,6 +118,8 @@ class SearchRunState:
     reserved_count: int = 0
     executed_count: int = 0
     blocked_count: int = 0
+    post_block_attempt_count: int = 0
+    post_stop_attempt_count: int = 0
     in_flight_count: int = 0
     extension_in_flight_count: int = 0
     extension_count: int = 0
@@ -127,6 +129,7 @@ class SearchRunState:
     normalized_queries: list[str] = field(default_factory=list)
     query_records: list[dict[str, Any]] = field(default_factory=list)
     seen_urls: set[str] = field(default_factory=set)
+    evidence_urls: list[str] = field(default_factory=list)
     seen_domains: set[str] = field(default_factory=set)
     blocked_reasons: dict[str, int] = field(default_factory=dict)
     extension_reasons: list[str] = field(default_factory=list)
@@ -145,6 +148,10 @@ class SearchRunState:
         normalized = normalize_query(query)
         with self.lock:
             self.attempted_count += 1
+            if self.blocked_count > 0:
+                self.post_block_attempt_count += 1
+            if self.stop_reason:
+                self.post_stop_attempt_count += 1
 
             if not normalized:
                 return self._block(
@@ -296,6 +303,8 @@ class SearchRunState:
                 round(duplicate_count / len(urls), 4) if urls else 0.0
             )
 
+            for url in sorted(new_urls):
+                self.evidence_urls.append(url)
             self.seen_urls.update(urls)
             self.seen_domains.update(domains)
             self.last_new_url_count = len(new_urls)
@@ -354,6 +363,8 @@ class SearchRunState:
                 "reserved_count": self.reserved_count,
                 "executed_count": self.executed_count,
                 "blocked_count": self.blocked_count,
+                "post_block_attempt_count": self.post_block_attempt_count,
+                "post_stop_attempt_count": self.post_stop_attempt_count,
                 "in_flight_count": self.in_flight_count,
                 "extension_in_flight_count": self.extension_in_flight_count,
                 "extension_count": self.extension_count,
@@ -477,10 +488,29 @@ def get_search_run_state() -> Optional[SearchRunState]:
     return _search_state_ctx.get()
 
 
+def configure_search_run(*, hard_limit: int) -> None:
+    """按任务复杂度收紧当前搜索硬预算，保留环境变量设置的更低上限。"""
+    state = get_search_run_state()
+    if state is None or hard_limit <= 0:
+        return
+    with state.lock:
+        state.hard_limit = min(state.hard_limit, hard_limit)
+        state.soft_limit = min(state.soft_limit, state.hard_limit)
+
+
 def get_search_snapshot() -> Optional[dict[str, Any]]:
     """获取当前任务可序列化的搜索状态摘要。"""
     state = get_search_run_state()
     return state.snapshot() if state else None
+
+
+def get_search_evidence_urls(limit: int = 5) -> list[str]:
+    """返回已验证搜索结果中的少量 URL，供主智能体引用兜底。"""
+    state = get_search_run_state()
+    if state is None or limit <= 0:
+        return []
+    with state.lock:
+        return list(state.evidence_urls[:limit])
 
 
 def finalize_search_run(reason: str = "agent_completed") -> Optional[dict[str, Any]]:

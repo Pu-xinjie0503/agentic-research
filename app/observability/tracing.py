@@ -428,11 +428,28 @@ def _build_model_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     summary = _empty_model_metrics()
     by_agent: dict[str, dict[str, Any]] = {}
+    call_sequence: list[dict[str, Any]] = []
 
     for span in model_spans:
         metadata = span.get("metadata") or {}
         result = span.get("result") or {}
         agent_name = str(metadata.get("agent_name") or "unknown")
+        call_sequence.append(
+            {
+                "agent_name": agent_name,
+                "call_index": int(metadata.get("call_index") or 0),
+                "input_message_count": int(
+                    metadata.get("input_message_count") or 0
+                ),
+                "input_char_count": int(metadata.get("input_char_count") or 0),
+                "input_tokens": result.get("input_tokens"),
+                "output_tokens": result.get("output_tokens"),
+                "total_tokens": result.get("total_tokens"),
+                "duration_ms": round(float(span.get("duration_ms") or 0), 2),
+                "end_reason": result.get("end_reason"),
+                "status": span.get("status"),
+            }
+        )
         agent_metrics = by_agent.setdefault(agent_name, _empty_model_metrics())
         for metrics in (summary, agent_metrics):
             metrics["call_count"] += 1
@@ -452,6 +469,14 @@ def _build_model_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
             if result.get("total_tokens") is not None:
                 metrics["token_reported_call_count"] += 1
 
+    call_sequence.sort(key=lambda item: item["call_index"])
+    summary["calls"] = call_sequence
+    _add_context_metrics(summary, call_sequence)
+    for agent_name, agent_metrics in by_agent.items():
+        agent_calls = [
+            call for call in call_sequence if call["agent_name"] == agent_name
+        ]
+        _add_context_metrics(agent_metrics, agent_calls)
     summary["by_agent"] = by_agent
     return summary
 
@@ -531,7 +556,54 @@ def _empty_model_metrics() -> dict[str, Any]:
         "output_tokens": None,
         "total_tokens": None,
         "token_reported_call_count": 0,
+        "first_input_char_count": None,
+        "last_input_char_count": None,
+        "max_input_char_count": None,
+        "input_char_growth_rate": None,
+        "first_input_tokens": None,
+        "last_input_tokens": None,
+        "max_input_tokens": None,
+        "input_token_growth_rate": None,
     }
+
+
+def _add_context_metrics(
+    metrics: dict[str, Any],
+    calls: list[dict[str, Any]],
+) -> None:
+    """补充首次、末次、最大输入规模和增长率。"""
+    if not calls:
+        return
+
+    char_values = [int(call["input_char_count"]) for call in calls]
+    metrics["first_input_char_count"] = char_values[0]
+    metrics["last_input_char_count"] = char_values[-1]
+    metrics["max_input_char_count"] = max(char_values)
+    metrics["input_char_growth_rate"] = _growth_rate(
+        char_values[0],
+        char_values[-1],
+    )
+
+    token_values = [
+        int(call["input_tokens"])
+        for call in calls
+        if isinstance(call.get("input_tokens"), int)
+    ]
+    if token_values:
+        metrics["first_input_tokens"] = token_values[0]
+        metrics["last_input_tokens"] = token_values[-1]
+        metrics["max_input_tokens"] = max(token_values)
+        metrics["input_token_growth_rate"] = _growth_rate(
+            token_values[0],
+            token_values[-1],
+        )
+
+
+def _growth_rate(first: int, last: int) -> Optional[float]:
+    """计算末次相对首次的增长率，首次为零时不计算。"""
+    if first <= 0:
+        return None
+    return round((last - first) / first, 4)
 
 
 def _add_optional_metric(

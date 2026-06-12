@@ -17,7 +17,9 @@ from app.api.context import (
 from app.observability.search_state import (
     SearchRunState,
     begin_search_run,
+    configure_search_run,
     finalize_search_run,
+    get_search_evidence_urls,
     get_search_run_state,
     reset_search_run,
 )
@@ -242,6 +244,37 @@ class SearchRunStateTests(unittest.TestCase):
             self.assertEqual(second_state.snapshot()["attempted_count"], 0)
             self.assertEqual(second_state.snapshot()["remaining_budget"], 5)
             reset_search_run(second_token)
+
+    def test_task_scope_can_tighten_search_budget(self) -> None:
+        token = begin_search_run("trace-scoped-budget")
+        try:
+            configure_search_run(hard_limit=3)
+            state = get_search_run_state()
+
+            self.assertIsNotNone(state)
+            self.assertEqual(state.snapshot()["soft_limit"], 3)
+            self.assertEqual(state.snapshot()["hard_limit"], 3)
+        finally:
+            reset_search_run(token)
+
+    def test_completed_search_exposes_limited_evidence_urls(self) -> None:
+        token = begin_search_run("trace-evidence-urls")
+        try:
+            active_state = get_search_run_state()
+            reservation = active_state.reserve("行业趋势")
+            active_state.complete(
+                reservation,
+                search_result(
+                    "https://b.example.com/article",
+                    "https://a.example.com/article",
+                ),
+            )
+
+            urls = get_search_evidence_urls(limit=1)
+        finally:
+            reset_search_run(token)
+
+        self.assertEqual(urls, ["https://a.example.com/article"])
 
 
 class InternetSearchToolTests(unittest.TestCase):
