@@ -16,6 +16,10 @@ from app.observability.search_state import get_search_snapshot
 class SearchGovernanceMiddleware(AgentMiddleware):
     """把当前搜索预算与信息增益状态注入网络 Agent 的系统提示词。"""
 
+    def __init__(self, *, direct_response: bool = False) -> None:
+        """配置预算耗尽后的最终输出形式。"""
+        self.direct_response = direct_response
+
     def wrap_model_call(self, request: ModelRequest, handler):
         """同步模型调用入口。"""
         return handler(self._inject_search_state(request))
@@ -24,12 +28,16 @@ class SearchGovernanceMiddleware(AgentMiddleware):
         """异步模型调用入口。"""
         return await handler(self._inject_search_state(request))
 
-    @staticmethod
-    def _inject_search_state(request: ModelRequest) -> ModelRequest:
+    def _inject_search_state(self, request: ModelRequest) -> ModelRequest:
         """构造当前模型决策所需的搜索治理摘要。"""
         snapshot = get_search_snapshot()
         if snapshot is None:
             return request
+        final_action = (
+            "直接输出最终回答"
+            if self.direct_response
+            else "提交 AgentHandoff"
+        )
 
         extension_rule = (
             f"3. 第 {snapshot['soft_limit'] + 1} 至 "
@@ -38,7 +46,7 @@ class SearchGovernanceMiddleware(AgentMiddleware):
             if snapshot["hard_limit"] > snapshot["soft_limit"]
             else (
                 "3. 本任务不开放软预算后的补搜；达到硬预算后，"
-                "下一条输出必须直接提交 AgentHandoff，禁止再次生成 "
+                f"下一条输出必须{final_action}，禁止再次生成 "
                 "internet_search 调用。"
             )
         )
@@ -60,7 +68,7 @@ class SearchGovernanceMiddleware(AgentMiddleware):
 1. 前 {snapshot['soft_limit']} 次搜索应覆盖互补角度，禁止仅做同义词改写。
 2. 当前决策为 review_required 时，先检查证据缺口；只有证据不足、来源单一或信息冲突才允许定向补搜。
 {extension_rule}
-4. 当前决策为 stop 时，下一条输出必须直接提交 AgentHandoff；禁止继续调用 internet_search，应基于已有证据完成总结并说明局限。
+4. 当前决策为 stop 时，下一条输出必须{final_action}；禁止继续调用 internet_search，应基于已有证据完成总结并说明局限。
 """
         current_prompt = request.system_message.text if request.system_message else ""
         tools = list(request.tools or [])

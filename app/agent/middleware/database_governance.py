@@ -11,6 +11,10 @@ from app.observability.database_state import get_database_snapshot
 class DatabaseGovernanceMiddleware(AgentMiddleware):
     """向数据库助手注入预算、缓存和停止状态。"""
 
+    def __init__(self, *, direct_response: bool = False) -> None:
+        """配置停止后是直接回答用户还是回传主智能体。"""
+        self.direct_response = direct_response
+
     def wrap_model_call(self, request: ModelRequest, handler):
         """同步模型调用入口。"""
         return handler(self._inject_state(request))
@@ -19,12 +23,16 @@ class DatabaseGovernanceMiddleware(AgentMiddleware):
         """异步模型调用入口。"""
         return await handler(self._inject_state(request))
 
-    @staticmethod
-    def _inject_state(request: ModelRequest) -> ModelRequest:
+    def _inject_state(self, request: ModelRequest) -> ModelRequest:
         """构造数据库助手决策提示。"""
         snapshot = get_database_snapshot()
         if snapshot is None:
             return request
+        response_target = (
+            "直接面向用户输出最终回答"
+            if self.direct_response
+            else "返回给主智能体"
+        )
         prompt = f"""
 
 【数据库治理状态】
@@ -41,7 +49,7 @@ class DatabaseGovernanceMiddleware(AgentMiddleware):
 3. 完全相同的 SQL 不得重复执行。
 4. 第 4、5 次 SQL 必须填写 continuation_reason 和 target_gap。
 5. 当前决策为 stop 时禁止继续执行 SQL，应使用已有结果完成回答。
-6. 返回给主智能体的结论控制在 4000 字符内，保留查询口径、关键数值和局限。
+6. {response_target}的结论控制在 4000 字符内，保留查询口径、关键数值和局限。
 """
         tools = list(request.tools or [])
         if snapshot["decision"] == "stop":

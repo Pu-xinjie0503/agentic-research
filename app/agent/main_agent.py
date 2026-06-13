@@ -17,7 +17,9 @@ from deepagents import create_deep_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
+from app.agent.direct.database_query import database_query_direct_agent
 from app.agent.direct.file_analysis import file_analysis_direct_agent
+from app.agent.direct.network_search import network_search_direct_agent
 from app.agent.llm import model
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.agent_governance import AgentGovernanceMiddleware
@@ -132,6 +134,22 @@ def should_use_file_direct_path(
     )
 
 
+def select_execution_route(
+    task_scope,
+    uploaded_files: list[str],
+) -> str:
+    """为无产物的单一能力任务选择直达路径。"""
+    if should_use_file_direct_path(task_scope, uploaded_files):
+        return "file_direct"
+    if task_scope.artifact_type is not None:
+        return "main_agent"
+    if task_scope.allowed_subagents == frozenset({"数据库查询助手"}):
+        return "database_direct"
+    if task_scope.allowed_subagents == frozenset({"网络搜索助手"}):
+        return "network_direct"
+    return "main_agent"
+
+
 def build_file_direct_request(
     task_query: str,
     uploaded_files: list[str],
@@ -159,6 +177,25 @@ def extract_final_agent_text(result: dict[str, Any]) -> str:
         if content:
             return str(content)
     return ""
+
+
+def _build_direct_execution(
+    execution_route: str,
+    task_query: str,
+    uploaded_files: list[str],
+):
+    """返回直达路径对应的 Agent、助手名称和请求正文。"""
+    if execution_route == "file_direct":
+        return (
+            file_analysis_direct_agent,
+            "文件分析助手",
+            build_file_direct_request(task_query, uploaded_files),
+        )
+    if execution_route == "database_direct":
+        return database_query_direct_agent, "数据库查询助手", task_query
+    if execution_route == "network_direct":
+        return network_search_direct_agent, "网络搜索助手", task_query
+    raise ValueError(f"不支持的直达路径：{execution_route}")
 
 
 async def run_deep_agent(
@@ -264,11 +301,11 @@ async def run_deep_agent(
 
         # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
         config = {"configurable": {"thread_id": session_id}}
-        use_file_direct_path = should_use_file_direct_path(
+        execution_route = select_execution_route(
             task_scope,
             uploaded_files,
         )
-        execution_route = "file_direct" if use_file_direct_path else "main_agent"
+        use_direct_path = execution_route != "main_agent"
         record_event(
             event_name="execution_route_selected",
             component="agent_governance",
@@ -308,7 +345,11 @@ async def run_deep_agent(
         """
 
         with trace_span(
-            "agent.file_direct.run" if use_file_direct_path else "agent.main.run",
+            (
+                f"agent.{execution_route}.run"
+                if use_direct_path
+                else "agent.main.run"
+            ),
             component="agent",
             metadata={
                 "session_id": session_id,
@@ -318,33 +359,40 @@ async def run_deep_agent(
         ) as agent_span:
             chunk_count = 0
             assistant_calls = []
-            if use_file_direct_path:
-                assistant_calls.append("文件分析助手")
+            if use_direct_path:
+                direct_agent, assistant_name, direct_request = (
+                    _build_direct_execution(
+                        execution_route,
+                        str(task_query),
+                        uploaded_files,
+                    )
+                )
+                assistant_calls.append(assistant_name)
                 monitor.report_assistant(
-                    "文件分析助手",
+                    assistant_name,
                     {
                         "mode": "direct",
                         "files": uploaded_files,
+                        "route": execution_route,
                     },
                 )
-                direct_result = await file_analysis_direct_agent.ainvoke(
+                direct_result = await direct_agent.ainvoke(
                     {
                         "messages": [
                             {
                                 "role": "user",
-                                "content": build_file_direct_request(
-                                    str(task_query),
-                                    uploaded_files,
-                                ),
+                                "content": direct_request,
                             }
                         ]
                     }
                 )
                 final_result = extract_final_agent_text(direct_result)
                 if not final_result:
-                    raise RuntimeError("文件直达 Agent 未返回最终文本")
+                    raise RuntimeError(
+                        f"{assistant_name}直达 Agent 未返回最终文本"
+                    )
                 safe_console_print(
-                    f"文件分析直达结果：{final_result[:100]}"
+                    f"{assistant_name}直达结果：{final_result[:100]}"
                 )
                 monitor.report_task_result(final_result)
             else:

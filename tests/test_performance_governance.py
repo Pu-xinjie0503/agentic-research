@@ -19,6 +19,7 @@ from app.agent.middleware.final_response_governance import (
 from app.agent.main_agent import (
     build_file_direct_request,
     extract_final_agent_text,
+    select_execution_route,
     should_use_file_direct_path,
 )
 from app.observability.agent_state import (
@@ -211,6 +212,32 @@ class AgentGovernanceTests(unittest.TestCase):
         self.assertTrue(
             should_use_file_direct_path(scope, ["industry_brief.md"])
         )
+        self.assertEqual(
+            select_execution_route(scope, ["industry_brief.md"]),
+            "file_direct",
+        )
+
+    def test_database_only_task_uses_direct_path(self) -> None:
+        scope = infer_task_scope(
+            "查询数据库中库存最低的 5 个药品，不调用网络，不生成文件",
+            has_uploaded_files=False,
+        )
+
+        self.assertEqual(
+            select_execution_route(scope, []),
+            "database_direct",
+        )
+
+    def test_network_only_task_uses_direct_path(self) -> None:
+        scope = infer_task_scope(
+            "搜索 2026 年跨境电商 AI 客服趋势并附来源，不生成文件",
+            has_uploaded_files=False,
+        )
+
+        self.assertEqual(
+            select_execution_route(scope, []),
+            "network_direct",
+        )
 
     def test_explicit_database_verification_still_enables_database_agent(self) -> None:
         scope = infer_task_scope(
@@ -238,6 +265,33 @@ class AgentGovernanceTests(unittest.TestCase):
         )
         self.assertFalse(
             should_use_file_direct_path(multi_scope, ["industry_brief.md"])
+        )
+        self.assertEqual(
+            select_execution_route(pdf_scope, ["industry_brief.md"]),
+            "main_agent",
+        )
+        self.assertEqual(
+            select_execution_route(multi_scope, ["industry_brief.md"]),
+            "main_agent",
+        )
+
+    def test_database_or_network_delivery_keeps_main_agent(self) -> None:
+        database_scope = infer_task_scope(
+            "查询数据库库存并生成 Markdown",
+            has_uploaded_files=False,
+        )
+        network_scope = infer_task_scope(
+            "搜索公开趋势并生成 PDF",
+            has_uploaded_files=False,
+        )
+
+        self.assertEqual(
+            select_execution_route(database_scope, []),
+            "main_agent",
+        )
+        self.assertEqual(
+            select_execution_route(network_scope, []),
+            "main_agent",
         )
 
     def test_file_direct_request_uses_only_uploaded_names(self) -> None:
