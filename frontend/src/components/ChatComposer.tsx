@@ -133,6 +133,7 @@ export function ChatComposer({
               />
             </Tooltip>
             <Upload
+              accept=".md,.txt,.docx,.pdf,.xlsx,.xls,.png,.jpg,.jpeg,.webp"
               beforeUpload={() => false}
               fileList={[]}
               multiple
@@ -141,7 +142,7 @@ export function ChatComposer({
               }}
               showUploadList={false}
             >
-              <Tooltip title="选择附件">
+              <Tooltip title="选择文档、图片或扫描 PDF">
                 <Button
                   aria-label="选择附件"
                   className="composer-icon-button"

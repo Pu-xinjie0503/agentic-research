@@ -727,6 +727,51 @@ textarea {
   color: var(--cyan) !important;
 }
 
+.memory-button {
+  min-height: 40px;
+  border-color: rgba(124, 140, 255, 0.32) !important;
+  background: rgba(124, 140, 255, 0.08) !important;
+  color: #aab4ff !important;
+}
+
+.memory-drawer .ant-drawer-content {
+  background:
+    linear-gradient(180deg, rgba(124, 140, 255, 0.07), transparent 30%),
+    #080d16;
+}
+
+.memory-drawer-tip {
+  color: var(--muted);
+}
+
+.memory-drawer .ant-list-item {
+  display: block;
+  border-block-end-color: rgba(113, 247, 255, 0.12);
+}
+
+.memory-title,
+.memory-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-title code {
+  color: var(--cyan);
+}
+
+.memory-meta {
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.memory-content {
+  margin: 10px 48px 0 0 !important;
+  color: var(--text);
+  line-height: 1.65;
+}
+
 .sidebar-section {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;

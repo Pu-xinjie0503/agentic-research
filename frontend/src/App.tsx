@@ -6,12 +6,14 @@ import {
   CloudServerOutlined,
   DatabaseOutlined,
   FileSearchOutlined,
+  HistoryOutlined,
   ToolOutlined
 } from "@ant-design/icons";
 import { Alert, App as AntApp, Button } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationThread } from "./components/ConversationThread";
+import { MemoryDrawer } from "./components/MemoryDrawer";
 import type { ChatTurn } from "./components/ConversationThread";
 import { API_BASE_URL, WS_BASE_URL } from "./lib/config";
 import { useDeepAgentSession } from "./hooks/useDeepAgentSession";
@@ -44,6 +46,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [stagedItems, setStagedItems] = useState<UploadedItem[]>([]);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [memoryDrawerOpen, setMemoryDrawerOpen] = useState(false);
   const streamRef = useRef<HTMLElement | null>(null);
   const session = useDeepAgentSession();
 
@@ -150,6 +153,14 @@ export default function App() {
         <Button className="new-chat-button" block onClick={handleNewSession}>
           新建研搜
         </Button>
+        <Button
+          className="memory-button"
+          block
+          icon={<HistoryOutlined />}
+          onClick={() => setMemoryDrawerOpen(true)}
+        >
+          长期记忆
+        </Button>
 
         <div className="sidebar-section">
           <span className="sidebar-label">THREAD</span>
@@ -249,6 +260,12 @@ export default function App() {
           uploadedItems={session.uploadedItems}
         />
       </main>
+      <MemoryDrawer
+        open={memoryDrawerOpen}
+        refreshToken={session.result}
+        userId={session.userId}
+        onClose={() => setMemoryDrawerOpen(false)}
+      />
     </div>
   );
 }

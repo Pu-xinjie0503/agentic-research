@@ -35,7 +35,24 @@ from app.api.context import (
     set_trace_context,
 )
 from app.api.monitor import manager
+from app.memory.service import memory_service, validate_user_id
 from app.observability.tracing import record_event, trace_span
+
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".md",
+    ".txt",
+    ".docx",
+    ".pdf",
+    ".xlsx",
+    ".xls",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+}
+MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_FILES = 8
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -112,6 +129,7 @@ class TaskRequest(BaseModel):
 
     query: str
     thread_id: str = None
+    user_id: str | None = None
 
 
 def _forget_task(thread_id: str, task: asyncio.Task) -> None:
@@ -135,6 +153,11 @@ async def run_task(request: TaskRequest):
     """
     thread_id = request.thread_id or str(uuid.uuid4())
     trace_id = get_trace_context() or str(uuid.uuid4())
+    if request.user_id:
+        try:
+            validate_user_id(request.user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     record_event(
         event_name="task_submitted",
@@ -149,11 +172,53 @@ async def run_task(request: TaskRequest):
         old_task.cancel()
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(run_deep_agent(request.query, thread_id, trace_id))
+    task = asyncio.create_task(
+        run_deep_agent(
+            request.query,
+            thread_id,
+            trace_id,
+            user_id=request.user_id,
+        )
+    )
     active_tasks[thread_id] = task
     task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
 
     return {"status": "started", "thread_id": thread_id, "trace_id": trace_id}
+
+
+@app.get("/api/memories")
+async def list_memories(user_id: str):
+    """列出指定用户的全部活动长期记忆。"""
+    try:
+        memories = memory_service.list_memories(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "memories": [memory.as_dict() for memory in memories],
+        "count": len(memories),
+    }
+
+
+@app.delete("/api/memories/{memory_id:path}")
+async def delete_memory(memory_id: str, user_id: str):
+    """按记忆 ID 软删除指定用户的一条长期记忆。"""
+    try:
+        deleted_id = memory_service.delete_memory(user_id, memory_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if deleted_id is None:
+        raise HTTPException(status_code=404, detail="长期记忆不存在")
+    return {"status": "deleted", "deleted_ids": [deleted_id]}
+
+
+@app.delete("/api/memories")
+async def clear_memories(user_id: str):
+    """软删除指定用户的全部长期记忆。"""
+    try:
+        deleted_ids = memory_service.clear(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status": "deleted", "deleted_ids": deleted_ids}
 
 
 @app.post("/api/task/{thread_id}/cancel")
@@ -200,17 +265,48 @@ async def upload_files(files: List[UploadFile] = File(...), thread_id: str = For
         files (List[UploadFile]): 文件对象列表。
         thread_id (str): 关联的任务会话 ID。
     """
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"单次最多上传 {MAX_UPLOAD_FILES} 个文件",
+        )
+
     # 上传文件先按会话隔离保存，避免不同任务读取到彼此的附件
     target_dir = updated_dir / f"session_{thread_id}"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
     for file in files:
-        file_path = target_dir / file.filename
-        # 直接复制文件流，避免大文件一次性读入内存
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        saved_files.append(file.filename)
+        safe_name = Path(file.filename or "").name
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="上传文件名不能为空")
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail=f"不支持的文件格式：{suffix or '无后缀'}",
+            )
+        file_path = target_dir / safe_name
+        written = 0
+        try:
+            with file_path.open("wb") as buffer:
+                while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_FILE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"文件 {safe_name} 超过 "
+                                f"{MAX_UPLOAD_FILE_BYTES // 1024 // 1024}MB 限制"
+                            ),
+                        )
+                    buffer.write(chunk)
+        except Exception:
+            file_path.unlink(missing_ok=True)
+            raise
+        finally:
+            await file.close()
+        saved_files.append(safe_name)
 
     return {"status": "uploaded", "files": saved_files}
 

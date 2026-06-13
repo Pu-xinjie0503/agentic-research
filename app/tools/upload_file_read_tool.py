@@ -3,9 +3,10 @@
 
 供主智能体读取用户在当前会话中上传的临时附件。工具会先通过 ContextVar
 拿到本次 session_dir，再把模型传入的文件名解析到真实路径，支持文本、
-Word、PDF 和 Excel 等常见格式。
+Word、PDF 和 Excel 等常见格式。图片和扫描 PDF 交给视觉工具处理。
 """
 
+import re
 from pathlib import Path
 from typing import Annotated
 
@@ -14,6 +15,7 @@ from langchain_core.tools import tool
 from app.api.context import get_session_context
 from app.api.monitor import monitor
 from app.observability.tracing import summarize_text, trace_span
+from app.multimodal.vision import IMAGE_EXTENSIONS
 from app.utils.path_utils import resolve_path
 
 # 文档解析依赖按需导入：缺少某类依赖时，只影响对应文件格式，不影响工具整体注册
@@ -91,6 +93,12 @@ def read_file_content(
             return result
 
         try:
+            if ext in IMAGE_EXTENSIONS:
+                return _finish(
+                    "该文件是图片，文本读取工具无法直接解析。"
+                    "请调用 analyze_visual_file 执行 OCR 和图片理解。"
+                )
+
             if ext in [".md", ".txt"]:
                 return _finish(file_path.read_text(encoding="utf-8"))
 
@@ -109,6 +117,12 @@ def read_file_content(
                 reader = pypdf.PdfReader(str(file_path))
                 text = "\n".join([page.extract_text() or "" for page in reader.pages])
                 span.set_result(page_count=len(reader.pages))
+                meaningful_text = re.sub(r"\s+", "", text)
+                if len(meaningful_text) < 50:
+                    return _finish(
+                        "该 PDF 未提取到足够文本，可能是扫描件或图片型 PDF。"
+                        "请调用 analyze_visual_file 执行逐页 OCR 和图片理解。"
+                    )
                 return _finish(text)
 
             elif ext in [".xlsx", ".xls"]:

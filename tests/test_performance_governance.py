@@ -17,8 +17,10 @@ from app.agent.middleware.final_response_governance import (
     FinalResponseGovernanceMiddleware,
 )
 from app.agent.main_agent import (
+    build_network_evidence_fallback,
     build_file_direct_request,
     extract_final_agent_text,
+    network_direct_response_is_usable,
     select_execution_route,
     should_use_file_direct_path,
 )
@@ -238,6 +240,52 @@ class AgentGovernanceTests(unittest.TestCase):
             select_execution_route(scope, []),
             "network_direct",
         )
+
+    def test_network_direct_rejects_tool_protocol_text(self) -> None:
+        self.assertFalse(
+            network_direct_response_is_usable(
+                '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke '
+                'name="internet_search">'
+            )
+        )
+        self.assertTrue(
+            network_direct_response_is_usable(
+                "结论\nhttps://a.example.com\n"
+                "https://b.example.com\nhttps://c.example.com"
+            )
+        )
+
+    def test_network_evidence_fallback_uses_verified_sources(self) -> None:
+        from app.observability.search_state import begin_search_run, reset_search_run
+
+        token = begin_search_run("trace-network-fallback")
+        try:
+            state = __import__(
+                "app.observability.search_state",
+                fromlist=["get_search_run_state"],
+            ).get_search_run_state()
+            reservation = state.reserve("测试搜索")
+            state.complete(
+                reservation,
+                {
+                    "results": [
+                        {
+                            "title": f"来源 {index}",
+                            "url": f"https://source{index}.example.com",
+                            "content": f"第 {index} 条公开证据摘要",
+                        }
+                        for index in range(1, 6)
+                    ]
+                },
+            )
+
+            fallback = build_network_evidence_fallback("测试任务")
+        finally:
+            reset_search_run(token)
+
+        self.assertIn("5 条可核验观察", fallback)
+        self.assertIn("https://source1.example.com", fallback)
+        self.assertIn("https://source5.example.com", fallback)
 
     def test_explicit_database_verification_still_enables_database_agent(self) -> None:
         scope = infer_task_scope(

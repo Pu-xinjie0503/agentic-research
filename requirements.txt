@@ -27,6 +27,8 @@ openpyxl>=3.1.0             # Excel 读取引擎，Pandas 依赖
 aiofiles>=23.0.0            # 异步文件操作
 markdown>=3.5               # Markdown 转 HTML，用于 word_converter.py
 reportlab>=4.0.0            # 跨平台 PDF 生成，用于 word_converter.py
+pillow>=10.0.0             # 图片方向纠正、压缩和视觉模型输入预处理
+pymupdf>=1.24.0            # 扫描 PDF 页面渲染，用于 OCR 与图片理解
 
 # --- 外部工具集成 (Integrations) ---
 tavily-python==0.7.24       # 联网搜索 API

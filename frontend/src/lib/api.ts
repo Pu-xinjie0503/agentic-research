@@ -1,5 +1,12 @@
 import { API_BASE_URL } from "./config";
-import type { CancelTaskResponse, FileListResponse, TaskResponse, UploadResponse } from "../types";
+import type {
+  CancelTaskResponse,
+  FileListResponse,
+  MemoryDeleteResponse,
+  MemoryListResponse,
+  TaskResponse,
+  UploadResponse
+} from "../types";
 
 function apiUrl(path: string): string {
   return `${API_BASE_URL}${path}`;
@@ -23,7 +30,11 @@ async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Pro
   return payload as T;
 }
 
-export async function startTask(query: string, threadId: string): Promise<TaskResponse> {
+export async function startTask(
+  query: string,
+  threadId: string,
+  userId: string
+): Promise<TaskResponse> {
   return requestJson<TaskResponse>(apiUrl("/api/task"), {
     method: "POST",
     headers: {
@@ -31,9 +42,35 @@ export async function startTask(query: string, threadId: string): Promise<TaskRe
     },
     body: JSON.stringify({
       query,
-      thread_id: threadId
+      thread_id: threadId,
+      user_id: userId
     })
   });
+}
+
+export async function listMemories(userId: string): Promise<MemoryListResponse> {
+  const url = new URL(apiUrl("/api/memories"));
+  url.searchParams.set("user_id", userId);
+  return requestJson<MemoryListResponse>(url);
+}
+
+export async function deleteMemory(
+  userId: string,
+  memoryId: string
+): Promise<MemoryDeleteResponse> {
+  const url = new URL(
+    apiUrl(`/api/memories/${encodeURIComponent(memoryId)}`)
+  );
+  url.searchParams.set("user_id", userId);
+  return requestJson<MemoryDeleteResponse>(url, { method: "DELETE" });
+}
+
+export async function clearMemories(
+  userId: string
+): Promise<MemoryDeleteResponse> {
+  const url = new URL(apiUrl("/api/memories"));
+  url.searchParams.set("user_id", userId);
+  return requestJson<MemoryDeleteResponse>(url, { method: "DELETE" });
 }
 
 export async function cancelTask(threadId: string): Promise<CancelTaskResponse> {

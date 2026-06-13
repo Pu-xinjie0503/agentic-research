@@ -63,3 +63,27 @@ export interface UploadedItem {
   size: number;
   raw: File;
 }
+
+export type MemoryCategory = "profile" | "preference" | "project";
+
+export interface MemoryRecord {
+  id: string;
+  category: MemoryCategory;
+  key: string;
+  content: string;
+  confidence: number;
+  source_thread_id: string;
+  source_trace_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryListResponse {
+  memories: MemoryRecord[];
+  count: number;
+}
+
+export interface MemoryDeleteResponse {
+  status: "deleted" | string;
+  deleted_ids: string[];
+}

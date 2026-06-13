@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelTask, listSessionFiles, startTask, uploadSessionFiles } from "../lib/api";
 import { WS_BASE_URL } from "../lib/config";
 import { createThreadId, getStoredThreadId, storeThreadId } from "../lib/thread";
+import { getStoredUserId } from "../lib/user";
 import type {
   ConnectionState,
   MonitorMessage,
@@ -23,6 +24,7 @@ export function useDeepAgentSession() {
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
   const uploadedNameSetRef = useRef<Set<string>>(new Set());
   const [threadId, setThreadId] = useState(getStoredThreadId);
+  const [userId] = useState(getStoredUserId);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [events, setEvents] = useState<MonitorMessage[]>([]);
   const [files, setFiles] = useState<OutputFile[]>([]);
@@ -205,7 +207,7 @@ export function useDeepAgentSession() {
       setResult("");
       setLastError("");
       try {
-        const response = await startTask(cleanQuery, threadId);
+        const response = await startTask(cleanQuery, threadId, userId);
         if (response.thread_id && response.thread_id !== threadId) {
           storeThreadId(response.thread_id);
           setThreadId(response.thread_id);
@@ -217,7 +219,7 @@ export function useDeepAgentSession() {
         throw error;
       }
     },
-    [threadId]
+    [threadId, userId]
   );
 
   const cancelCurrentTask = useCallback(async () => {
@@ -313,6 +315,7 @@ export function useDeepAgentSession() {
     cancelCurrentTask,
     submitTask,
     threadId,
+    userId,
     uploadFiles,
     uploadedItems
   };

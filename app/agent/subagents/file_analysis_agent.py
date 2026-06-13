@@ -12,6 +12,7 @@ from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
+from app.tools.multimodal_tools import analyze_visual_file
 from app.tools.upload_file_read_tool import read_file_content
 
 # 文件分析助手只负责读取和分析当前会话工作目录中的上传附件
@@ -24,9 +25,11 @@ file_analysis_agent = {
         schema=AgentHandoff,
         handle_errors=HANDOFF_ERROR_MESSAGE,
     ),
-    "tools": [read_file_content],
+    "tools": [read_file_content, analyze_visual_file],
     "middleware": [
-        ToolAllowlistMiddleware({"read_file_content"}),
+        ToolAllowlistMiddleware(
+            {"read_file_content", "analyze_visual_file"}
+        ),
         ModelTracingMiddleware("文件分析助手"),
         ModelCallLimitMiddleware(run_limit=6, exit_behavior="error"),
     ],

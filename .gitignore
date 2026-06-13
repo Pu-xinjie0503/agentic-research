@@ -6,6 +6,8 @@
 app/output
 app/updated
 app/logs/
+app/data/*.sqlite3
+app/data/*.sqlite3-*
 agent_workspace/
 /out-tsc
 # Only exists if Bazel was run
@@ -26,6 +28,8 @@ frontend/.vite/
 venv/
 env/
 .env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 *$py.class

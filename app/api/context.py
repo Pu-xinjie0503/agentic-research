@@ -1,7 +1,7 @@
 """
 请求上下文管理模块
 
-负责在异步请求链路中保存当前任务的 thread_id、trace_id 和 session_dir
+负责在异步请求链路中保存当前任务的 user_id、thread_id、trace_id 和 session_dir
 工具、智能体和监控模块可以在深层调用中读取这些值，而不需要层层传参
 """
 
@@ -20,6 +20,10 @@ _thread_id_ctx: ContextVar[Optional[str]] = ContextVar(
 )
 _trace_id_ctx: ContextVar[Optional[str]] = ContextVar(
     "trace_id",
+    default=None,
+)
+_user_id_ctx: ContextVar[Optional[str]] = ContextVar(
+    "user_id",
     default=None,
 )
 
@@ -97,6 +101,34 @@ def reset_trace_context(trace_token: Token[Optional[str]]) -> None:
     :param trace_token: set_trace_context 返回的 token
     """
     _trace_id_ctx.reset(trace_token)
+
+
+def set_user_context(user_id: Optional[str]) -> Token[Optional[str]]:
+    """
+    设置当前请求链路的长期记忆用户 ID
+
+    :param user_id: 前端持久化的用户标识；为空时禁用长期记忆
+    :return: reset 时需要使用的上下文 token
+    """
+    return _user_id_ctx.set(user_id)
+
+
+def get_user_context() -> Optional[str]:
+    """
+    获取当前请求链路的长期记忆用户 ID
+
+    :return: 当前用户 ID；未设置时返回 None
+    """
+    return _user_id_ctx.get()
+
+
+def reset_user_context(user_token: Token[Optional[str]]) -> None:
+    """
+    恢复用户上下文，避免并发任务串用长期记忆
+
+    :param user_token: set_user_context 返回的 token
+    """
+    _user_id_ctx.reset(user_token)
 
 
 def reset_session_context(

@@ -7,6 +7,7 @@ session_id 创建独立工作目录，并把工具调用、子智能体调用和
 """
 
 import asyncio
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from app.agent.direct.database_query import database_query_direct_agent
 from app.agent.direct.file_analysis import file_analysis_direct_agent
 from app.agent.direct.network_search import network_search_direct_agent
 from app.agent.llm import model
+from app.agent.middleware.memory_context import MemoryContextMiddleware
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.agent_governance import AgentGovernanceMiddleware
 from app.agent.middleware.final_response_governance import (
@@ -35,11 +37,16 @@ from app.api.context import (
     reset_session_context,
     reset_thread_context,
     reset_trace_context,
+    reset_user_context,
     set_session_context,
     set_thread_context,
     set_trace_context,
+    set_user_context,
 )
 from app.api.monitor import monitor
+from app.memory.context import reset_memory_prompt, set_memory_prompt
+from app.memory.runtime import memory_store
+from app.memory.service import memory_service
 from app.observability.tracing import (
     begin_trace,
     finish_trace,
@@ -52,6 +59,7 @@ from app.observability.search_state import (
     begin_search_run,
     configure_search_run,
     finalize_search_run,
+    get_search_evidence_records,
     reset_search_run,
 )
 from app.observability.agent_state import (
@@ -81,6 +89,7 @@ main_agent = create_deep_agent(
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf],
     middleware=[
+        MemoryContextMiddleware(),
         AgentGovernanceMiddleware(),
         ToolAllowlistMiddleware(
             {"task", "generate_markdown", "convert_md_to_pdf"},
@@ -91,6 +100,7 @@ main_agent = create_deep_agent(
         ModelCallLimitMiddleware(run_limit=14, exit_behavior="error"),
     ],
     checkpointer=InMemorySaver(),
+    store=memory_store,
     subagents=[database_query_agent, network_search_agent, file_analysis_agent],
 )
 
@@ -179,6 +189,45 @@ def extract_final_agent_text(result: dict[str, Any]) -> str:
     return ""
 
 
+def network_direct_response_is_usable(content: str) -> bool:
+    """拒绝工具协议泄漏和缺少基本引用的网络直达回答。"""
+    text = str(content or "")
+    protocol_markers = (
+        "<｜｜DSML｜｜",
+        "<|DSML|",
+        "<tool_calls>",
+        '"name":"internet_search"',
+    )
+    if any(marker in text for marker in protocol_markers):
+        return False
+    return len(re.findall(r"https?://[^\s\])}>\"']+", text)) >= 3
+
+
+def build_network_evidence_fallback(task_query: str) -> str:
+    """从已验证证据目录构造无需额外模型调用的网络回答。"""
+    records = get_search_evidence_records(limit=5)
+    if not records:
+        return ""
+    lines = [
+        "以下根据本次网络搜索的已验证证据，整理 5 条可核验观察。",
+        f"任务：{task_query}",
+    ]
+    for index, record in enumerate(records, start=1):
+        title = str(record.get("source_title") or f"来源 {index}").strip()
+        excerpt = re.sub(
+            r"\s+",
+            " ",
+            str(record.get("evidence_excerpt") or ""),
+        ).strip()[:220]
+        url = str(record.get("source_url") or "").strip()
+        lines.append(
+            f"\n## {index}. {title}\n"
+            f"{excerpt or '该来源提供了与任务相关的公开证据。'}\n"
+            f"来源：{url}"
+        )
+    return "\n".join(lines)
+
+
 def _build_direct_execution(
     execution_route: str,
     task_query: str,
@@ -203,6 +252,7 @@ async def run_deep_agent(
     session_id,
     trace_id=None,
     run_metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> AgentRunResult:
     """
     异步流式执行主智能体
@@ -216,6 +266,7 @@ async def run_deep_agent(
     trace_id = trace_id or str(uuid.uuid4())
     trace_token = set_trace_context(trace_id)
     session_id_token = set_thread_context(session_id)
+    user_id_token = set_user_context(user_id)
     trace_state_token = begin_trace(
         trace_id,
         session_id,
@@ -226,6 +277,7 @@ async def run_deep_agent(
     agent_state_token = begin_agent_run(trace_id)
     database_state_token = begin_database_run(trace_id)
     session_dir_token = None
+    memory_prompt_token = None
     final_status = "success"
     final_error = None
     trace_summary = None
@@ -278,11 +330,29 @@ async def run_deep_agent(
                 uploaded_files=uploaded_files,
             )
 
-        task_scope = infer_task_scope(
+        memory_preparation = await memory_service.prepare(
+            user_id,
             str(task_query),
+            str(session_id),
+            trace_id,
+        )
+        memory_prompt_token = set_memory_prompt(memory_preparation.prompt)
+        effective_query = memory_preparation.task_query or str(task_query)
+        routing_query = (
+            ""
+            if memory_preparation.direct_response
+            else effective_query
+        )
+
+        task_scope = infer_task_scope(
+            routing_query,
             has_uploaded_files=bool(uploaded_files),
         )
-        allowed_subagents = set(task_scope.allowed_subagents)
+        allowed_subagents = (
+            set()
+            if memory_preparation.direct_response
+            else set(task_scope.allowed_subagents)
+        )
         configure_agent_run(allowed_subagents)
         if task_scope.artifact_type or len(allowed_subagents) > 1:
             configure_search_run(hard_limit=3)
@@ -301,11 +371,16 @@ async def run_deep_agent(
 
         # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
         config = {"configurable": {"thread_id": session_id}}
-        execution_route = select_execution_route(
-            task_scope,
-            uploaded_files,
+        execution_route = (
+            "memory_direct"
+            if memory_preparation.direct_response
+            else select_execution_route(task_scope, uploaded_files)
         )
-        use_direct_path = execution_route != "main_agent"
+        use_direct_path = execution_route in {
+            "file_direct",
+            "database_direct",
+            "network_direct",
+        }
         record_event(
             event_name="execution_route_selected",
             component="agent_governance",
@@ -333,7 +408,7 @@ async def run_deep_agent(
 
         规则：
         1. 新生成文件必须保存到工作目录：'{relative_session_dir_str}/filename'
-        2. 读取已上传的文件时，请调用文件分析助手，并要求它直接将文件名（例如：'开篇.txt'）作为 filename 参数传入读取工具，不要带上任何目录前缀。
+        2. 读取已上传文件时调用文件分析助手：文本、Word、Excel 和文本型 PDF 使用 read_file_content；图片或扫描 PDF 使用 analyze_visual_file。只传文件名，不要带目录前缀。
         3. 使用相对路径，禁止使用绝对路径
         4. 若存在上传文件，请先分析内容
         5. 本次允许调用的专家仅限：{', '.join(sorted(allowed_subagents)) or '无'}。不得调用列表之外的专家。
@@ -346,24 +421,35 @@ async def run_deep_agent(
 
         with trace_span(
             (
-                f"agent.{execution_route}.run"
-                if use_direct_path
-                else "agent.main.run"
+                "agent.main.run"
+                if execution_route == "main_agent"
+                else f"agent.{execution_route}.run"
             ),
             component="agent",
             metadata={
                 "session_id": session_id,
-                "task_query": summarize_text(task_query),
+                "task_query": summarize_text(effective_query),
                 "execution_route": execution_route,
             },
         ) as agent_span:
             chunk_count = 0
             assistant_calls = []
-            if use_direct_path:
+            if execution_route == "memory_direct":
+                assistant_calls.append("长期记忆管理器")
+                monitor.report_assistant(
+                    "长期记忆管理器",
+                    {
+                        "mode": "direct",
+                        "route": execution_route,
+                    },
+                )
+                final_result = memory_preparation.direct_response
+                monitor.report_task_result(final_result)
+            elif use_direct_path:
                 direct_agent, assistant_name, direct_request = (
                     _build_direct_execution(
                         execution_route,
-                        str(task_query),
+                        effective_query,
                         uploaded_files,
                     )
                 )
@@ -391,6 +477,27 @@ async def run_deep_agent(
                     raise RuntimeError(
                         f"{assistant_name}直达 Agent 未返回最终文本"
                     )
+                if (
+                    execution_route == "network_direct"
+                    and not network_direct_response_is_usable(final_result)
+                ):
+                    fallback_result = build_network_evidence_fallback(
+                        effective_query
+                    )
+                    if fallback_result:
+                        record_event(
+                            event_name="network_response_fallback",
+                            component="response_governance",
+                            message="网络直达回答格式异常，已改用证据目录兜底",
+                            status="warning",
+                            metadata={
+                                "original_summary": summarize_text(final_result),
+                                "evidence_count": len(
+                                    get_search_evidence_records(limit=5)
+                                ),
+                            },
+                        )
+                        final_result = fallback_result
                 safe_console_print(
                     f"{assistant_name}直达结果：{final_result[:100]}"
                 )
@@ -402,7 +509,7 @@ async def run_deep_agent(
                         "messages": [
                             {
                                 "role": "user",
-                                "content": task_query + path_instruction,
+                                "content": effective_query + path_instruction,
                             }
                         ]
                     },
@@ -488,10 +595,13 @@ async def run_deep_agent(
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
         if session_dir_token is not None:
             reset_session_context(session_dir_token)
+        if memory_prompt_token is not None:
+            reset_memory_prompt(memory_prompt_token)
         reset_search_run(search_state_token)
         reset_database_run(database_state_token)
         reset_agent_run(agent_state_token)
         reset_trace_state(trace_state_token)
+        reset_user_context(user_id_token)
         reset_thread_context(session_id_token)
         reset_trace_context(trace_token)
 
