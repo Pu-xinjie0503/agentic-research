@@ -375,10 +375,39 @@ def infer_task_scope(
         r"(?:(?:分析|读取|使用|调用)?\s*"
         r"(?:附件(?:分析)?|上传(?:文件|资料)(?:分析)?|文件分析))",
     )
+    database_action_requested = bool(
+        re.search(
+            r"(?:查询|调用|使用|连接|访问)\s*(?:当前|内部)?\s*"
+            r"(?:数据库|mysql)|"
+            r"(?:数据库|mysql)\s*(?:中|里|内)\s*"
+            r"(?:查询|查找|获取|统计|核验)|"
+            r"(?:执行|编写)\s*(?:sql|查询语句)",
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
+    database_reference_only = bool(
+        re.search(
+            r"(?:需要|待|需|后续|建议)\s*(?:通过)?\s*数据库"
+            r"(?:进行)?\s*(?:核验|验证|补充)(?:的)?\s*"
+            r"(?:数据|信息|事项|指标)?",
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
 
     if has_uploaded_files and not file_denied:
         allowed.add("文件分析助手")
-    if any(keyword in query for keyword in DATABASE_KEYWORDS) and not database_denied:
+    if (
+        (
+            database_action_requested
+            or (
+                any(keyword in query for keyword in DATABASE_KEYWORDS)
+                and not database_reference_only
+            )
+        )
+        and not database_denied
+    ):
         allowed.add("数据库查询助手")
     if any(keyword in query for keyword in NETWORK_KEYWORDS) and not network_denied:
         allowed.add("网络搜索助手")

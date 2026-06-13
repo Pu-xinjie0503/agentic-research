@@ -17,6 +17,7 @@ from deepagents import create_deep_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
+from app.agent.direct.file_analysis import file_analysis_direct_agent
 from app.agent.llm import model
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.agent_governance import AgentGovernanceMiddleware
@@ -118,6 +119,46 @@ def _collect_artifacts(session_dir: Path | None) -> list[dict[str, Any]]:
         for path in sorted(session_dir.rglob("*"))
         if path.is_file()
     ]
+
+
+def should_use_file_direct_path(
+    task_scope,
+    uploaded_files: list[str],
+) -> bool:
+    """仅让无产物、无其他能力依赖的上传文件任务走直达路径。"""
+    return bool(uploaded_files) and (
+        task_scope.allowed_subagents == frozenset({"文件分析助手"})
+        and task_scope.artifact_type is None
+    )
+
+
+def build_file_direct_request(
+    task_query: str,
+    uploaded_files: list[str],
+) -> str:
+    """构造文件直达 Agent 的最小运行时请求。"""
+    file_list = "\n".join(f"- {filename}" for filename in uploaded_files)
+    return f"""用户任务：
+{task_query}
+
+当前会话上传文件：
+{file_list}
+
+请逐个读取上述文件，只根据文件内容完成分析并直接回答用户。"""
+
+
+def extract_final_agent_text(result: dict[str, Any]) -> str:
+    """从 Agent 最终状态中提取最后一条非工具调用文本。"""
+    for message in reversed(result.get("messages") or []):
+        if getattr(message, "tool_calls", None):
+            continue
+        text = getattr(message, "text", None)
+        if text:
+            return str(text)
+        content = getattr(message, "content", None)
+        if content:
+            return str(content)
+    return ""
 
 
 async def run_deep_agent(
@@ -223,6 +264,21 @@ async def run_deep_agent(
 
         # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
         config = {"configurable": {"thread_id": session_id}}
+        use_file_direct_path = should_use_file_direct_path(
+            task_scope,
+            uploaded_files,
+        )
+        execution_route = "file_direct" if use_file_direct_path else "main_agent"
+        record_event(
+            event_name="execution_route_selected",
+            component="agent_governance",
+            message=f"已选择 {execution_route} 执行路径",
+            metadata={
+                "route": execution_route,
+                "uploaded_files": uploaded_files,
+                "task_scope": task_scope.snapshot(),
+            },
+        )
 
         # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
         evidence_policy = (
@@ -252,61 +308,99 @@ async def run_deep_agent(
         """
 
         with trace_span(
-            "agent.main.run",
+            "agent.file_direct.run" if use_file_direct_path else "agent.main.run",
             component="agent",
             metadata={
                 "session_id": session_id,
                 "task_query": summarize_text(task_query),
+                "execution_route": execution_route,
             },
         ) as agent_span:
             chunk_count = 0
             assistant_calls = []
-            # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
-            async for chunk in main_agent.astream(
-                {
-                    "messages": [
-                        {"role": "user", "content": task_query + path_instruction}
-                    ]
-                },
-                config=config,
-            ):
-                chunk_count += 1
-                # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
-                for node_name, state in chunk.items():
-                    if not state or "messages" not in state:
-                        continue
-                    messages = state["messages"]
-                    if messages and isinstance(messages, list):
-                        last_msg = messages[-1]
-                        if node_name == "model":
-                            if last_msg.tool_calls:
-                                # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
-                                for tool_call in last_msg.tool_calls:
-                                    if tool_call["name"] == "task":
-                                        assistant_name = tool_call["args"][
-                                            "subagent_type"
-                                        ]
-                                        assistant_calls.append(assistant_name)
-                                        # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
-                                        monitor.report_assistant(
-                                            assistant_name,
-                                            {
-                                                "description": tool_call["args"][
-                                                    "description"
-                                                ]
-                                            },
-                                        )
-                            elif last_msg.content:
-                                # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                                final_result = last_msg.text or str(last_msg.content)
-                                safe_console_print(
-                                    f"主智能体执行结果，最终结果：{final_result[:100]}"
-                                )
-                                monitor.report_task_result(final_result)
+            if use_file_direct_path:
+                assistant_calls.append("文件分析助手")
+                monitor.report_assistant(
+                    "文件分析助手",
+                    {
+                        "mode": "direct",
+                        "files": uploaded_files,
+                    },
+                )
+                direct_result = await file_analysis_direct_agent.ainvoke(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": build_file_direct_request(
+                                    str(task_query),
+                                    uploaded_files,
+                                ),
+                            }
+                        ]
+                    }
+                )
+                final_result = extract_final_agent_text(direct_result)
+                if not final_result:
+                    raise RuntimeError("文件直达 Agent 未返回最终文本")
+                safe_console_print(
+                    f"文件分析直达结果：{final_result[:100]}"
+                )
+                monitor.report_task_result(final_result)
+            else:
+                # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
+                async for chunk in main_agent.astream(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": task_query + path_instruction,
+                            }
+                        ]
+                    },
+                    config=config,
+                ):
+                    chunk_count += 1
+                    # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
+                    for node_name, state in chunk.items():
+                        if not state or "messages" not in state:
+                            continue
+                        messages = state["messages"]
+                        if messages and isinstance(messages, list):
+                            last_msg = messages[-1]
+                            if node_name == "model":
+                                if last_msg.tool_calls:
+                                    # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
+                                    for tool_call in last_msg.tool_calls:
+                                        if tool_call["name"] == "task":
+                                            assistant_name = tool_call["args"][
+                                                "subagent_type"
+                                            ]
+                                            assistant_calls.append(assistant_name)
+                                            # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
+                                            monitor.report_assistant(
+                                                assistant_name,
+                                                {
+                                                    "description": tool_call["args"][
+                                                        "description"
+                                                    ]
+                                                },
+                                            )
+                                elif last_msg.content:
+                                    # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
+                                    final_result = last_msg.text or str(
+                                        last_msg.content
+                                    )
+                                    safe_console_print(
+                                        "主智能体执行结果，最终结果："
+                                        f"{final_result[:100]}"
+                                    )
+                                    monitor.report_task_result(final_result)
 
             agent_span.set_result(
                 chunk_count=chunk_count,
                 assistant_calls=assistant_calls,
+                execution_route=execution_route,
                 final_result_summary=summarize_text(final_result),
             )
 

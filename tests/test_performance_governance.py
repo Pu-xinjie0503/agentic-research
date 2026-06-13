@@ -16,6 +16,11 @@ from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
 from app.agent.middleware.final_response_governance import (
     FinalResponseGovernanceMiddleware,
 )
+from app.agent.main_agent import (
+    build_file_direct_request,
+    extract_final_agent_text,
+    should_use_file_direct_path,
+)
 from app.observability.agent_state import (
     AgentRunState,
     infer_allowed_subagents,
@@ -194,6 +199,81 @@ class AgentGovernanceTests(unittest.TestCase):
         self.assertEqual(scope.allowed_subagents, {"数据库查询助手"})
         self.assertIn("文件分析助手", scope.forbidden_subagents)
         self.assertEqual(scope.artifact_type, "pdf")
+
+    def test_file_only_task_uses_direct_path(self) -> None:
+        scope = infer_task_scope(
+            "请分析我上传的附件，指出需要数据库核验的数据，"
+            "不调用网络，不生成文件",
+            has_uploaded_files=True,
+        )
+
+        self.assertEqual(scope.allowed_subagents, {"文件分析助手"})
+        self.assertTrue(
+            should_use_file_direct_path(scope, ["industry_brief.md"])
+        )
+
+    def test_explicit_database_verification_still_enables_database_agent(self) -> None:
+        scope = infer_task_scope(
+            "请分析附件，再查询数据库核验相关药品库存",
+            has_uploaded_files=True,
+        )
+
+        self.assertEqual(
+            scope.allowed_subagents,
+            {"文件分析助手", "数据库查询助手"},
+        )
+
+    def test_file_delivery_or_multi_source_task_keeps_main_agent(self) -> None:
+        pdf_scope = infer_task_scope(
+            "请分析附件并生成 PDF",
+            has_uploaded_files=True,
+        )
+        multi_scope = infer_task_scope(
+            "请分析附件并搜索最新趋势",
+            has_uploaded_files=True,
+        )
+
+        self.assertFalse(
+            should_use_file_direct_path(pdf_scope, ["industry_brief.md"])
+        )
+        self.assertFalse(
+            should_use_file_direct_path(multi_scope, ["industry_brief.md"])
+        )
+
+    def test_file_direct_request_uses_only_uploaded_names(self) -> None:
+        request = build_file_direct_request(
+            "提取核心观点",
+            ["brief.md", "table.xlsx"],
+        )
+
+        self.assertIn("- brief.md", request)
+        self.assertIn("- table.xlsx", request)
+        self.assertNotIn("E:\\", request)
+
+    def test_extract_final_agent_text_skips_tool_call_message(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        result = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "read_file_content",
+                            "args": {"filename": "brief.md"},
+                            "id": "call-read",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="文件分析完成。"),
+            ]
+        }
+
+        self.assertEqual(
+            extract_final_agent_text(result),
+            "文件分析完成。",
+        )
 
 
 class DatabaseGovernanceTests(unittest.TestCase):
