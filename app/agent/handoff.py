@@ -7,6 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.agent.evidence import (
+    EvidenceRecord,
+    downgrade_precision_claim,
+    extract_precision_claims,
+)
+
 
 MAX_SUMMARY_CHARS = 500
 MAX_FACTS = 8
@@ -55,7 +61,6 @@ class HandoffFact(BaseModel):
         default="",
         description="数据库查询口径、字段说明或文件章节定位",
     )
-
     @field_validator(
         "statement",
         "source_name",
@@ -83,6 +88,17 @@ class HandoffFact(BaseModel):
             flags=re.IGNORECASE,
         ):
             raise ValueError("网络事实必须包含真实 HTTP/HTTPS 来源 URL")
+        if self.source_type == "network":
+            evidence = EvidenceRecord(
+                claim=self.statement,
+                source_url=self.source_url,
+                source_title=self.source_name,
+            )
+            if (
+                extract_precision_claims(self.statement)
+                and not evidence.supports_numeric_claim
+            ):
+                self.statement = downgrade_precision_claim(self.statement)
         if self.source_type == "database" and not self.source_locator:
             raise ValueError("数据库事实必须包含查询口径或字段定位")
         if self.source_type == "file" and not self.source_name:

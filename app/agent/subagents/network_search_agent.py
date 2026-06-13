@@ -27,8 +27,12 @@ network_search_agent = {
     ),
     "tools": [internet_search],
     "middleware": [
-        ToolAllowlistMiddleware({"internet_search"}),
         SearchGovernanceMiddleware(),
+        ToolAllowlistMiddleware(
+            {"internet_search"},
+            retry_unknown_tool_calls=True,
+            response_tools={"AgentHandoff"},
+        ),
         ModelTracingMiddleware("网络搜索助手"),
         ModelCallLimitMiddleware(run_limit=10, exit_behavior="error"),
     ],

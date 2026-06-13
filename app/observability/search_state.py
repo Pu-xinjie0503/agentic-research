@@ -17,6 +17,8 @@ from threading import RLock
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
+from app.agent.evidence import EvidenceRecord
+
 
 ALLOWED_CONTINUATION_REASONS = {
     "evidence_gap",
@@ -130,6 +132,7 @@ class SearchRunState:
     query_records: list[dict[str, Any]] = field(default_factory=list)
     seen_urls: set[str] = field(default_factory=set)
     evidence_urls: list[str] = field(default_factory=list)
+    evidence_records: list[dict[str, Any]] = field(default_factory=list)
     seen_domains: set[str] = field(default_factory=set)
     blocked_reasons: dict[str, int] = field(default_factory=dict)
     extension_reasons: list[str] = field(default_factory=list)
@@ -260,6 +263,8 @@ class SearchRunState:
                     "status": "reserved",
                 }
             )
+            if self.reserved_count >= self.hard_limit:
+                self._stop("hard_limit")
             return SearchReservation(
                 allowed=True,
                 query=query,
@@ -305,6 +310,13 @@ class SearchRunState:
 
             for url in sorted(new_urls):
                 self.evidence_urls.append(url)
+            known_evidence_urls = {
+                item["source_url"] for item in self.evidence_records
+            }
+            for item in self._extract_evidence_records(result or {}):
+                if item["source_url"] not in known_evidence_urls:
+                    self.evidence_records.append(item)
+                    known_evidence_urls.add(item["source_url"])
             self.seen_urls.update(urls)
             self.seen_domains.update(domains)
             self.last_new_url_count = len(new_urls)
@@ -371,6 +383,7 @@ class SearchRunState:
                 "extension_reasons": list(self.extension_reasons),
                 "unique_url_count": len(self.seen_urls),
                 "unique_domain_count": len(self.seen_domains),
+                "evidence_tier_counts": self._evidence_tier_counts(),
                 "no_gain_count": self.no_gain_count,
                 "last_new_url_count": self.last_new_url_count,
                 "last_duplicate_ratio": self.last_duplicate_ratio,
@@ -451,6 +464,33 @@ class SearchRunState:
                 return record
         return None
 
+    def _evidence_tier_counts(self) -> dict[str, int]:
+        """统计当前任务网络证据来源等级。调用方必须持有锁。"""
+        counts: dict[str, int] = {}
+        for item in self.evidence_records:
+            tier = str(item.get("source_tier") or "unknown")
+            counts[tier] = counts.get(tier, 0) + 1
+        return counts
+
+    @staticmethod
+    def _extract_evidence_records(result: dict[str, Any]) -> list[dict[str, Any]]:
+        """将搜索结果转换为统一证据记录。"""
+        records = []
+        for item in result.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                record = EvidenceRecord(
+                    source_url=str(item.get("url") or ""),
+                    source_title=str(item.get("title") or ""),
+                    published_at=str(item.get("published_date") or ""),
+                    evidence_excerpt=str(item.get("content") or ""),
+                )
+            except ValueError:
+                continue
+            records.append(record.model_dump())
+        return records
+
     @staticmethod
     def _extract_urls(result: dict[str, Any]) -> set[str]:
         """从 Tavily 结构化结果中提取有效 URL。"""
@@ -511,6 +551,15 @@ def get_search_evidence_urls(limit: int = 5) -> list[str]:
         return []
     with state.lock:
         return list(state.evidence_urls[:limit])
+
+
+def get_search_evidence_records(limit: int = 15) -> list[dict[str, Any]]:
+    """返回有界网络证据目录，供主智能体和产物校验复用。"""
+    state = get_search_run_state()
+    if state is None or limit <= 0:
+        return []
+    with state.lock:
+        return [dict(item) for item in state.evidence_records[:limit]]
 
 
 def finalize_search_run(reason: str = "agent_completed") -> Optional[dict[str, Any]]:

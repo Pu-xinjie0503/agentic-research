@@ -78,10 +78,11 @@ main_agent = create_deep_agent(
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf],
     middleware=[
-        ToolAllowlistMiddleware(
-            {"task", "generate_markdown", "convert_md_to_pdf"}
-        ),
         AgentGovernanceMiddleware(),
+        ToolAllowlistMiddleware(
+            {"task", "generate_markdown", "convert_md_to_pdf"},
+            retry_unknown_tool_calls=True,
+        ),
         FinalResponseGovernanceMiddleware(),
         ModelTracingMiddleware("主智能体"),
         ModelCallLimitMiddleware(run_limit=14, exit_behavior="error"),
@@ -227,7 +228,8 @@ async def run_deep_agent(
         evidence_policy = (
             "本次属于多源组合或文档交付任务。外部趋势只保留可核验的"
             "定性结论、政策变化和技术方向；禁止写入第三方市场规模、"
-            "CAGR、预测金额，以及没有权威来源支撑的人口等精确数字。"
+            "CAGR、预测金额、并购或融资金额，以及没有权威来源支撑的"
+            "人口等精确数字。"
             if task_scope.artifact_type or len(allowed_subagents) > 1
             else "按用户任务保留必要事实，并确保精确数字可由来源 URL 核验。"
         )
@@ -243,6 +245,10 @@ async def run_deep_agent(
         4. 若存在上传文件，请先分析内容
         5. 本次允许调用的专家仅限：{', '.join(sorted(allowed_subagents)) or '无'}。不得调用列表之外的专家。
         6. 证据策略：{evidence_policy}
+        7. 主智能体不存在 read_file、glob、ls、write_todos 等文件系统工具。专家返回后直接调用 generate_markdown；上传文件只能通过 task 委派给文件分析助手读取。
+        8. 生成报告时必须保留上传文件中的具体对象、观察结论和信息缺口，不得把附件事实替换成泛化行业描述。
+        9. 报告必须包含“待核验/信息缺口”和“风险与边界”两类说明；网络引用只能使用证据目录中的相关 URL，不得引用与任务主题无关的真实链接。
+        10. 通用行业或政策证据不得外推为某个具体药品已经出现价格、需求、份额或集采影响；只有证据标题或摘要直接点名该药品时才可形成品种级外部结论，否则只写行业层趋势和待核验项。
         """
 
         with trace_span(

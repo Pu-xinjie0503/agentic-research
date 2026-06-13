@@ -10,6 +10,7 @@ from langchain_core.messages import SystemMessage, ToolMessage
 
 from app.observability.agent_state import get_agent_run_state, get_agent_snapshot
 from app.observability.search_state import (
+    get_search_evidence_records,
     get_search_evidence_urls,
     get_search_snapshot,
 )
@@ -146,13 +147,39 @@ class AgentGovernanceMiddleware(AgentMiddleware):
 """
         current_prompt = request.system_message.text if request.system_message else ""
         evidence_urls = get_search_evidence_urls()
-        evidence_prompt = (
-            "\n【已验证的网络来源 URL 兜底】\n"
-            + "\n".join(f"- {url}" for url in evidence_urls)
-            + "\n结构化交接遗漏链接时，只能从以上真实 URL 中补回引用。\n"
-            if evidence_urls
-            else ""
-        )
+        evidence_records = get_search_evidence_records(limit=5)
+        evidence_prompt = ""
+        if evidence_records:
+            catalog_lines = []
+            for item in evidence_records:
+                catalog_lines.append(
+                    f"- [{item['source_tier']}] {item['source_title']} | "
+                    f"{item['published_at'] or '日期未知'} | "
+                    f"{item['source_url']} | "
+                    f"证据摘要：{item['evidence_excerpt'][:120]}"
+                )
+            authoritative_count = sum(
+                item["source_tier"]
+                in {"tier_1_official", "tier_2_primary"}
+                for item in evidence_records
+            )
+            evidence_prompt += (
+                "\n【网络证据目录】\n"
+                + "\n".join(catalog_lines)
+                + "\n精确市场数字只能使用 tier_1_official 或 "
+                "tier_2_primary 中原文明确出现的数字；其他来源只写定性趋势。\n"
+                + (
+                    "当前目录没有高等级来源，禁止写入任何外部精确数字。\n"
+                    if authoritative_count == 0
+                    else ""
+                )
+            )
+        elif evidence_urls:
+            evidence_prompt = (
+                "\n【已验证的网络来源 URL 兜底】\n"
+                + "\n".join(f"- {url}" for url in evidence_urls[:5])
+                + "\n结构化交接遗漏链接时，只能从以上真实 URL 中补回引用。\n"
+            )
         tools = [
             AgentGovernanceMiddleware._scope_task_tool(
                 tool,

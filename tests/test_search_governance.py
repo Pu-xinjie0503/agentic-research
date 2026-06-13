@@ -64,10 +64,12 @@ class FakeTavilyClient:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.topics: list[str] = []
         self.fixed_url: str | None = None
 
     def search(self, query: str, **kwargs) -> dict:
         self.calls.append(query)
+        self.topics.append(str(kwargs.get("topic") or ""))
         url = self.fixed_url or f"https://source{len(self.calls)}.example.com/article"
         return search_result(url)
 
@@ -257,6 +259,23 @@ class SearchRunStateTests(unittest.TestCase):
         finally:
             reset_search_run(token)
 
+    def test_hard_limit_is_visible_when_last_call_is_reserved(self) -> None:
+        state = SearchRunState(
+            trace_id="trace-hard-limit-reserved",
+            soft_limit=3,
+            hard_limit=3,
+            similarity_threshold=0.82,
+        )
+
+        reservations = [
+            state.reserve(query)
+            for query in ["行业市场规模", "行业监管政策", "行业技术趋势"]
+        ]
+
+        self.assertTrue(all(item.allowed for item in reservations))
+        self.assertEqual(state.snapshot()["decision"], "stop")
+        self.assertEqual(state.snapshot()["stop_reason"], "hard_limit")
+
     def test_completed_search_exposes_limited_evidence_urls(self) -> None:
         token = begin_search_run("trace-evidence-urls")
         try:
@@ -345,6 +364,26 @@ class InternetSearchToolTests(unittest.TestCase):
         self.assertEqual(len(fake_client.calls), 4)
         self.assertEqual(extension["search_control"]["call_index"], 4)
         self.assertEqual(extension["search_control"]["phase"], "EXTENDED")
+
+    def test_chinese_policy_query_uses_general_topic(self) -> None:
+        tavily_module = importlib.import_module("app.tools.tavily_tool")
+        fake_client = FakeTavilyClient()
+
+        with (
+            patch.object(tavily_module, "tavily_client", fake_client),
+            patch.object(tavily_module, "record_event"),
+            patch.object(tavily_module.monitor, "report_tool"),
+            patch.object(tavily_module, "trace_span", dummy_trace_span),
+        ):
+            tavily_module.internet_search.invoke(
+                {
+                    "query": "2026年药品集采政策与经营趋势",
+                    "topic": "news",
+                    "search_purpose": "核验政策变化",
+                }
+            )
+
+        self.assertEqual(fake_client.topics, ["general"])
 
     def test_trace_summary_contains_search_metrics(self) -> None:
         tavily_module = importlib.import_module("app.tools.tavily_tool")

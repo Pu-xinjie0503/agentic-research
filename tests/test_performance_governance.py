@@ -23,7 +23,7 @@ from app.observability.agent_state import (
 )
 from app.observability.database_state import DatabaseRunState
 from app.tools.db_tools import _compact_rows, validate_read_only_query
-from app.tools.tavily_tool import compact_search_result
+from app.tools.tavily_tool import compact_search_result, search_result_relevance
 from app.utils.console import safe_console_print
 
 
@@ -297,6 +297,42 @@ class ResultCompactionTests(unittest.TestCase):
         self.assertIn("结果已按上下文上限截断", result)
         self.assertNotIn("a" * 100, result)
 
+    def test_irrelevant_search_result_is_filtered(self) -> None:
+        compacted = compact_search_result(
+            {
+                "query": "2026年阿莫西林集采政策 抗菌药物管理",
+                "results": [
+                    {
+                        "title": "意大利罗勒霜霉病农药紧急授权",
+                        "url": "https://example.com/agriculture",
+                        "content": "生物杀菌剂用于农作物病害防治。",
+                    },
+                    {
+                        "title": "阿莫西林集采与抗菌药物管理政策",
+                        "url": "https://example.com/amoxicillin",
+                        "content": "阿莫西林供应保障和抗菌药物分级管理持续推进。",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(len(compacted["results"]), 1)
+        self.assertEqual(
+            compacted["results"][0]["url"],
+            "https://example.com/amoxicillin",
+        )
+
+    def test_relevance_accepts_matching_english_term(self) -> None:
+        score = search_result_relevance(
+            "2026 OTC ibuprofen trend",
+            {
+                "title": "Ibuprofen remains a core OTC pain medicine",
+                "content": "Retail pharmacy demand remains stable.",
+            },
+        )
+
+        self.assertGreater(score, 0)
+
 
 class ToolAllowlistTests(unittest.TestCase):
     """验证内置 todo 和文件系统工具不会暴露给业务 Agent。"""
@@ -321,6 +357,129 @@ class ToolAllowlistTests(unittest.TestCase):
             ["task", "generate_markdown"],
         )
 
+    def test_unavailable_tool_call_is_detected_for_main_agent(self) -> None:
+        from langchain.agents.middleware import ModelResponse
+        from langchain_core.messages import AIMessage
+
+        middleware = ToolAllowlistMiddleware(
+            {"task", "generate_markdown", "convert_md_to_pdf"},
+            retry_unknown_tool_calls=True,
+        )
+        response = ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "glob",
+                            "args": {"pattern": "*.md"},
+                            "id": "call-glob",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "ls",
+                            "args": {},
+                            "id": "call-ls",
+                            "type": "tool_call",
+                        },
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(
+            middleware.find_unavailable_tool_calls(response),
+            ("glob", "ls"),
+        )
+
+    def test_declared_tool_call_does_not_need_correction(self) -> None:
+        from langchain.agents.middleware import ModelResponse
+        from langchain_core.messages import AIMessage
+
+        middleware = ToolAllowlistMiddleware(
+            {"generate_markdown"},
+            retry_unknown_tool_calls=True,
+        )
+        response = ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "generate_markdown",
+                            "args": {"filename": "report.md", "content": "# 报告"},
+                            "id": "call-markdown",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(
+            middleware.find_unavailable_tool_calls(response),
+            (),
+        )
+
+    def test_tool_removed_for_current_round_is_detected(self) -> None:
+        from langchain.agents.middleware import ModelResponse
+        from langchain_core.messages import AIMessage
+
+        middleware = ToolAllowlistMiddleware(
+            {"task", "generate_markdown"},
+            retry_unknown_tool_calls=True,
+        )
+        response = ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {},
+                            "id": "call-task",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(
+            middleware.find_unavailable_tool_calls(response, []),
+            ("task",),
+        )
+
+    def test_structured_response_tool_can_be_exempted(self) -> None:
+        from langchain.agents.middleware import ModelResponse
+        from langchain_core.messages import AIMessage
+
+        middleware = ToolAllowlistMiddleware(
+            {"internet_search"},
+            retry_unknown_tool_calls=True,
+            response_tools={"AgentHandoff"},
+        )
+        response = ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "AgentHandoff",
+                            "args": {},
+                            "id": "call-handoff",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(
+            middleware.find_unavailable_tool_calls(response, []),
+            (),
+        )
+
 
 class FinalResponseGovernanceTests(unittest.TestCase):
     """验证引用校验只针对缺少 URL 的最终回答。"""
@@ -339,7 +498,13 @@ class FinalResponseGovernanceTests(unittest.TestCase):
             reservation = state.reserve("测试搜索")
             state.complete(
                 reservation,
-                {"results": [{"url": "https://example.com/source"}]},
+                {
+                    "results": [
+                        {"url": "https://a.example.com"},
+                        {"url": "https://b.example.com"},
+                        {"url": "https://c.example.com"},
+                    ]
+                },
             )
             response = ModelResponse(
                 result=[AIMessage(content="只有结论，没有来源链接")]
@@ -423,7 +588,13 @@ class FinalResponseGovernanceTests(unittest.TestCase):
             reservation = state.reserve("测试搜索")
             state.complete(
                 reservation,
-                {"results": [{"url": "https://example.com/source"}]},
+                {
+                    "results": [
+                        {"url": "https://a.example.com"},
+                        {"url": "https://b.example.com"},
+                        {"url": "https://c.example.com"},
+                    ]
+                },
             )
             content = (
                 "# 报告\n"
@@ -442,6 +613,152 @@ class FinalResponseGovernanceTests(unittest.TestCase):
             self.assertIsNone(error)
         finally:
             reset_search_run(token)
+
+    def test_markdown_blocks_commercial_market_number(self) -> None:
+        from app.observability.search_state import begin_search_run, reset_search_run
+
+        token = begin_search_run("trace-commercial-number")
+        try:
+            state = __import__(
+                "app.observability.search_state",
+                fromlist=["get_search_run_state"],
+            ).get_search_run_state()
+            reservation = state.reserve("医药市场趋势")
+            state.complete(
+                reservation,
+                {
+                    "results": [
+                        {
+                            "title": "Market Size Forecast",
+                            "url": "https://www.grandviewresearch.com/report/1",
+                            "content": "The market may reach USD 51.9 billion.",
+                        }
+                    ]
+                },
+            )
+            content = (
+                "市场规模预计达到 51.9 亿美元。\n"
+                "https://www.grandviewresearch.com/report/1\n"
+                "https://a.example.com\n"
+                "https://b.example.com"
+            )
+
+            error = FinalResponseGovernanceMiddleware.markdown_citation_error(
+                {
+                    "name": "generate_markdown",
+                    "args": {"content": content},
+                }
+            )
+
+            self.assertIn("缺少高等级来源原文对齐", error)
+        finally:
+            reset_search_run(token)
+
+    def test_markdown_allows_matching_official_market_number(self) -> None:
+        from app.observability.search_state import begin_search_run, reset_search_run
+
+        token = begin_search_run("trace-official-number")
+        try:
+            state = __import__(
+                "app.observability.search_state",
+                fromlist=["get_search_run_state"],
+            ).get_search_run_state()
+            reservation = state.reserve("官方医药市场统计")
+            state.complete(
+                reservation,
+                {
+                    "results": [
+                        {
+                            "title": "监管机构年度报告",
+                            "url": "https://www.nmpa.gov.cn/report/2026",
+                            "content": "官方报告显示市场规模达到 51.9 亿美元。",
+                        },
+                        {"url": "https://a.example.com"},
+                        {"url": "https://b.example.com"},
+                    ]
+                },
+            )
+            content = (
+                "市场规模达到 51.9 亿美元。\n"
+                "https://www.nmpa.gov.cn/report/2026\n"
+                "https://a.example.com\n"
+                "https://b.example.com"
+            )
+
+            error = FinalResponseGovernanceMiddleware.markdown_citation_error(
+                {
+                    "name": "generate_markdown",
+                    "args": {"content": content},
+                }
+            )
+
+            self.assertIsNone(error)
+        finally:
+            reset_search_run(token)
+
+    def test_markdown_requires_uploaded_text_fact_coverage(self) -> None:
+        from app.api.context import reset_session_context, set_session_context
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "brief.md"
+            source_path.write_text(
+                "# 经营简报\n"
+                "1. 阿莫西林胶囊库存周转速度较快，需要核对有效期。\n"
+                "2. 布洛芬缓释胶囊近期销售需求上升，缺少具体销量。\n"
+                "3. 盐酸二甲双胍片属于慢病用药，需要结合销售记录。\n"
+                "4. 当前材料不包含公开市场趋势和外部行业证据。\n",
+                encoding="utf-8",
+            )
+            session_token = set_session_context(temp_dir)
+            try:
+                error = FinalResponseGovernanceMiddleware.markdown_citation_error(
+                    {
+                        "name": "generate_markdown",
+                        "args": {
+                            "filename": "report",
+                            "content": "# 行业报告\n仅包含泛化行业趋势。",
+                        },
+                    }
+                )
+            finally:
+                reset_session_context(session_token)
+
+        self.assertIn("核心事实覆盖不足", error)
+        self.assertIn("阿莫西林胶囊库存周转速度较快", error)
+
+    def test_markdown_accepts_sufficient_uploaded_text_facts(self) -> None:
+        from app.api.context import reset_session_context, set_session_context
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "brief.md"
+            source_path.write_text(
+                "# 经营简报\n"
+                "1. 阿莫西林胶囊库存周转速度较快，需要核对有效期。\n"
+                "2. 布洛芬缓释胶囊近期销售需求上升，缺少具体销量。\n"
+                "3. 盐酸二甲双胍片属于慢病用药，需要结合销售记录。\n"
+                "4. 当前材料不包含公开市场趋势和外部行业证据。\n",
+                encoding="utf-8",
+            )
+            session_token = set_session_context(temp_dir)
+            try:
+                error = FinalResponseGovernanceMiddleware.markdown_citation_error(
+                    {
+                        "name": "generate_markdown",
+                        "args": {
+                            "filename": "report",
+                            "content": (
+                                "# 报告\n"
+                                "阿莫西林胶囊库存周转速度较快，需核对有效期。\n"
+                                "布洛芬缓释胶囊近期销售需求上升，"
+                                "但材料缺少具体销量。"
+                            ),
+                        },
+                    }
+                )
+            finally:
+                reset_session_context(session_token)
+
+        self.assertIsNone(error)
 
 
 class EvaluationQualityTests(unittest.TestCase):

@@ -272,15 +272,22 @@ def _build_table(rows: list[list[str]], styles: dict[str, ParagraphStyle]):
         [Paragraph(_format_inline(cell), styles["body"]) for cell in row]
         for row in normalized_rows
     ]
-    table = Table(data, repeatRows=1)
+    available_width = A4[0] - 4 * cm
+    column_width = available_width / column_count
+    horizontal_padding = min(6, max(1, column_width * 0.15))
+    table = Table(
+        data,
+        colWidths=[column_width] * column_count,
+        repeatRows=1,
+    )
     table.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), horizontal_padding),
+                ("RIGHTPADDING", (0, 0), (-1, -1), horizontal_padding),
                 ("TOPPADDING", (0, 0), (-1, -1), 5),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]

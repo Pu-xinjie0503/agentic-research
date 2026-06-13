@@ -6,6 +6,7 @@ Tavily 网络搜索工具模块
 """
 
 import os
+import re
 from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
@@ -22,6 +23,23 @@ load_dotenv()
 # TavilyClient 是实际访问搜索服务的客户端；模块级复用可避免每次工具调用重复初始化
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+GENERIC_QUERY_TERMS = {
+    "中国",
+    "全球",
+    "行业",
+    "市场",
+    "趋势",
+    "最新",
+    "政策",
+    "发展",
+    "变化",
+    "研究",
+    "分析",
+    "相关",
+    "公开",
+    "信息",
+}
+
 
 def _truncate_text(value: Any, limit: int) -> str:
     """截断外部搜索文本，避免单次工具结果挤占过多上下文。"""
@@ -32,14 +50,19 @@ def _truncate_text(value: Any, limit: int) -> str:
 def compact_search_result(raw_result: Any) -> dict[str, Any]:
     """保留 Tavily 关键结构，并限制结果数量和正文长度。"""
     source = dict(raw_result) if isinstance(raw_result, dict) else {"result": raw_result}
+    query = str(source.get("query") or "")
     compact_results = []
     for item in list(source.get("results") or [])[:5]:
         if not isinstance(item, dict):
+            continue
+        relevance_score = search_result_relevance(query, item)
+        if query and relevance_score <= 0:
             continue
         compact_item = {
             "title": _truncate_text(item.get("title"), 300),
             "url": str(item.get("url") or ""),
             "content": _truncate_text(item.get("content"), 600),
+            "relevance_score": relevance_score,
         }
         if item.get("score") is not None:
             compact_item["score"] = item["score"]
@@ -50,7 +73,7 @@ def compact_search_result(raw_result: Any) -> dict[str, Any]:
         compact_results.append(compact_item)
 
     result = {
-        "query": str(source.get("query") or ""),
+        "query": query,
         "answer": _truncate_text(source.get("answer"), 1000),
         "results": compact_results,
     }
@@ -58,6 +81,47 @@ def compact_search_result(raw_result: Any) -> dict[str, Any]:
         if source.get(key) is not None:
             result[key] = source[key]
     return result
+
+
+def search_result_relevance(query: str, item: dict[str, Any]) -> float:
+    """根据查询核心词与结果文本重合度做保守相关性判断。"""
+    normalized_query = str(query or "").lower()
+    if not normalized_query:
+        return 1.0
+    result_text = " ".join(
+        str(item.get(field) or "")
+        for field in ("title", "content", "raw_content")
+    ).lower()
+    if not result_text:
+        return 0.0
+
+    english_terms = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9+-]{2,}", normalized_query)
+        if token
+        not in {"the", "and", "for", "with", "latest", "market", "trend"}
+    }
+    english_matches = sum(term in result_text for term in english_terms)
+
+    chinese_terms: set[str] = set()
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", normalized_query):
+        if chunk not in GENERIC_QUERY_TERMS:
+            chinese_terms.add(chunk)
+        chinese_terms.update(
+            chunk[index : index + 2]
+            for index in range(len(chunk) - 1)
+            if chunk[index : index + 2] not in GENERIC_QUERY_TERMS
+        )
+    chinese_matches = sum(term in result_text for term in chinese_terms)
+    required_chinese_matches = 2 if len(chinese_terms) >= 4 else 1
+
+    if english_matches > 0 or chinese_matches >= required_chinese_matches:
+        denominator = max(1, len(english_terms) + min(6, len(chinese_terms)))
+        return round(
+            min(1.0, (english_matches + chinese_matches) / denominator),
+            4,
+        )
+    return 0.0
 
 
 # @tool 会把函数签名和 docstring 暴露给 DeepAgents，模型据此决定是否调用以及如何填参
@@ -164,10 +228,16 @@ def internet_search(
         },
     ) as span:
         try:
+            effective_topic = (
+                "general"
+                if re.search(r"[\u4e00-\u9fff]", query)
+                and re.search(r"政策|行业|市场|经营|集采|医保|药品", query)
+                else topic
+            )
             # Tavily 返回 query、results、title、url、content 等结构化字段，后续由子智能体阅读并汇总
             raw_result = tavily_client.search(
                 query=query,
-                topic=topic,
+                topic=effective_topic,
                 max_results=max_results,
                 include_raw_content=include_raw_content,
             )
