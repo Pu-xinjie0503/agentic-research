@@ -8,6 +8,7 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 
 from app.agent.prompts import sub_agents_content
 from app.agent.handoff import AgentHandoff, HANDOFF_ERROR_MESSAGE
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
 from langchain.agents.middleware import ModelCallLimitMiddleware
@@ -28,7 +29,10 @@ file_analysis_agent = {
     "tools": [read_file_content, analyze_visual_file],
     "middleware": [
         ToolAllowlistMiddleware(
-            {"read_file_content", "analyze_visual_file"}
+            tool_allowlist(
+                "file_analysis_agent",
+                {"read_file_content", "analyze_visual_file"},
+            )
         ),
         ModelTracingMiddleware("文件分析助手"),
         ModelCallLimitMiddleware(run_limit=6, exit_behavior="error"),

@@ -7,6 +7,7 @@ session_id 创建独立工作目录，并把工具调用、子智能体调用和
 """
 
 import asyncio
+import os
 import re
 import shutil
 import uuid
@@ -29,6 +30,7 @@ from app.agent.middleware.final_response_governance import (
     FinalResponseGovernanceMiddleware,
 )
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
+from app.agent.governance_config import route_policy, tool_allowlist
 from app.agent.prompts import main_agent_content
 from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.file_analysis_agent import file_analysis_agent
@@ -71,8 +73,14 @@ from app.observability.agent_state import (
 )
 from app.observability.database_state import (
     begin_database_run,
+    configure_database_run,
     finalize_database_run,
     reset_database_run,
+)
+from app.observability.evidence_pack import (
+    begin_evidence_pack,
+    finalize_evidence_pack,
+    reset_evidence_pack,
 )
 
 # 交付类工具由主智能体直接掌握，负责生成最终 Markdown/PDF 文档
@@ -92,7 +100,10 @@ main_agent = create_deep_agent(
         MemoryContextMiddleware(),
         AgentGovernanceMiddleware(),
         ToolAllowlistMiddleware(
-            {"task", "generate_markdown", "convert_md_to_pdf"},
+            tool_allowlist(
+                "main_agent",
+                {"task", "generate_markdown", "convert_md_to_pdf"},
+            ),
             retry_unknown_tool_calls=True,
         ),
         FinalResponseGovernanceMiddleware(),
@@ -107,6 +118,15 @@ main_agent = create_deep_agent(
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
 project_root_path = Path(__file__).parents[1].resolve()
 
+ROUTE_MODE_OPTIMIZED = "optimized_router"
+ROUTE_MODE_BASELINE_MAIN_AGENT = "baseline_main_agent"
+SUPPORTED_ROUTE_MODES = frozenset(
+    {
+        ROUTE_MODE_OPTIMIZED,
+        ROUTE_MODE_BASELINE_MAIN_AGENT,
+    }
+)
+
 
 @dataclass(frozen=True)
 class AgentRunResult:
@@ -115,6 +135,27 @@ class AgentRunResult:
     trace_summary: dict[str, Any] | None
     final_result: str
     artifacts: list[dict[str, Any]]
+
+
+def normalize_execution_route_mode(route_mode: str | None) -> str:
+    """标准化执行路由模式，非法配置直接暴露给调用方。"""
+    normalized = (route_mode or ROUTE_MODE_OPTIMIZED).strip().lower()
+    if normalized not in SUPPORTED_ROUTE_MODES:
+        supported = ", ".join(sorted(SUPPORTED_ROUTE_MODES))
+        raise ValueError(
+            f"不支持的 AGENT_ROUTE_MODE={route_mode!r}，可选值：{supported}"
+        )
+    return normalized
+
+
+def resolve_execution_route_mode(
+    run_metadata: dict[str, Any] | None = None,
+) -> str:
+    """从运行元数据或环境变量读取本次执行的路由模式。"""
+    metadata_mode = (run_metadata or {}).get("route_mode")
+    if metadata_mode:
+        return normalize_execution_route_mode(str(metadata_mode))
+    return normalize_execution_route_mode(os.getenv("AGENT_ROUTE_MODE"))
 
 
 def _collect_artifacts(session_dir: Path | None) -> list[dict[str, Any]]:
@@ -147,8 +188,12 @@ def should_use_file_direct_path(
 def select_execution_route(
     task_scope,
     uploaded_files: list[str],
+    route_mode: str = ROUTE_MODE_OPTIMIZED,
 ) -> str:
     """为无产物的单一能力任务选择直达路径。"""
+    route_mode = normalize_execution_route_mode(route_mode)
+    if route_mode == ROUTE_MODE_BASELINE_MAIN_AGENT:
+        return "main_agent"
     if should_use_file_direct_path(task_scope, uploaded_files):
         return "file_direct"
     if task_scope.artifact_type is not None:
@@ -264,6 +309,11 @@ async def run_deep_agent(
     :param trace_id: 当前任务执行链路 ID；不传时自动生成
     """
     trace_id = trace_id or str(uuid.uuid4())
+    route_mode = resolve_execution_route_mode(run_metadata)
+    run_metadata = {
+        **(run_metadata or {}),
+        "route_mode": route_mode,
+    }
     trace_token = set_trace_context(trace_id)
     session_id_token = set_thread_context(session_id)
     user_id_token = set_user_context(user_id)
@@ -276,6 +326,7 @@ async def run_deep_agent(
     search_state_token = begin_search_run(trace_id)
     agent_state_token = begin_agent_run(trace_id)
     database_state_token = begin_database_run(trace_id)
+    evidence_pack_token = begin_evidence_pack(trace_id)
     session_dir_token = None
     memory_prompt_token = None
     final_status = "success"
@@ -353,9 +404,6 @@ async def run_deep_agent(
             if memory_preparation.direct_response
             else set(task_scope.allowed_subagents)
         )
-        configure_agent_run(allowed_subagents)
-        if task_scope.artifact_type or len(allowed_subagents) > 1:
-            configure_search_run(hard_limit=3)
         record_event(
             event_name="task_scope_inferred",
             component="agent_governance",
@@ -374,8 +422,13 @@ async def run_deep_agent(
         execution_route = (
             "memory_direct"
             if memory_preparation.direct_response
-            else select_execution_route(task_scope, uploaded_files)
+            else select_execution_route(task_scope, uploaded_files, route_mode)
         )
+        policy = route_policy(execution_route)
+        allowed_subagents = policy.filter_subagents(allowed_subagents)
+        configure_agent_run(allowed_subagents)
+        configure_search_run(hard_limit=policy.search_hard_limit)
+        configure_database_run(hard_limit=policy.database_hard_limit)
         use_direct_path = execution_route in {
             "file_direct",
             "database_direct",
@@ -387,6 +440,8 @@ async def run_deep_agent(
             message=f"已选择 {execution_route} 执行路径",
             metadata={
                 "route": execution_route,
+                "route_mode": route_mode,
+                "route_policy": policy.snapshot(),
                 "uploaded_files": uploaded_files,
                 "task_scope": task_scope.snapshot(),
             },
@@ -417,6 +472,7 @@ async def run_deep_agent(
         8. 生成报告时必须保留上传文件中的具体对象、观察结论和信息缺口，不得把附件事实替换成泛化行业描述。
         9. 报告必须包含“待核验/信息缺口”和“风险与边界”两类说明；网络引用只能使用证据目录中的相关 URL，不得引用与任务主题无关的真实链接。
         10. 通用行业或政策证据不得外推为某个具体药品已经出现价格、需求、份额或集采影响；只有证据标题或摘要直接点名该药品时才可形成品种级外部结论，否则只写行业层趋势和待核验项。
+        11. 本次工具结果会自动登记到 Evidence Pack。最终回答必须基于工具证据，区分已证实事实、合理推断和信息缺口；长期记忆不能作为外部事实证据。
         """
 
         with trace_span(
@@ -577,6 +633,7 @@ async def run_deep_agent(
         search_summary = finalize_search_run(search_stop_reason)
         finalize_agent_run(search_stop_reason)
         finalize_database_run(search_stop_reason)
+        finalize_evidence_pack()
         if search_summary:
             record_event(
                 event_name="search_stop",
@@ -600,6 +657,7 @@ async def run_deep_agent(
         reset_search_run(search_state_token)
         reset_database_run(database_state_token)
         reset_agent_run(agent_state_token)
+        reset_evidence_pack(evidence_pack_token)
         reset_trace_state(trace_state_token)
         reset_user_context(user_id_token)
         reset_thread_context(session_id_token)

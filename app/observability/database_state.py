@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Optional
+
+from app.agent.governance_config import budget_int
 
 
 ALLOWED_QUERY_REASONS = {
@@ -23,11 +24,7 @@ _database_state_ctx: ContextVar[Optional["DatabaseRunState"]] = ContextVar(
 
 def _read_positive_int(name: str, default: int) -> int:
     """读取正整数环境变量。"""
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    return budget_int(name, default)
 
 
 def normalize_sql(query: str) -> str:
@@ -259,6 +256,23 @@ def get_database_snapshot() -> Optional[dict[str, Any]]:
     """获取数据库治理摘要。"""
     state = get_database_run_state()
     return state.snapshot() if state else None
+
+
+def configure_database_run(
+    *,
+    hard_limit: int | None = None,
+    soft_limit: int | None = None,
+) -> None:
+    """按路由策略收紧当前 SQL 查询预算。"""
+    state = get_database_run_state()
+    if state is None:
+        return
+    with state.lock:
+        if hard_limit and hard_limit > 0:
+            state.hard_limit = min(state.hard_limit, hard_limit)
+        if soft_limit and soft_limit > 0:
+            state.soft_limit = min(state.soft_limit, soft_limit)
+        state.soft_limit = min(state.soft_limit, state.hard_limit)
 
 
 def finalize_database_run(reason: str) -> Optional[dict[str, Any]]:

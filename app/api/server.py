@@ -36,6 +36,7 @@ from app.api.context import (
 )
 from app.api.monitor import manager
 from app.memory.service import memory_service, validate_user_id
+from app.observability.trace_store import trace_store
 from app.observability.tracing import record_event, trace_span
 
 ALLOWED_UPLOAD_EXTENSIONS = {
@@ -219,6 +220,43 @@ async def clear_memories(user_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"status": "deleted", "deleted_ids": deleted_ids}
+
+
+@app.get("/api/traces")
+async def list_traces(
+    limit: int = 50,
+    route_mode: str | None = None,
+    status: str | None = None,
+):
+    """列出最近任务 trace 摘要，供面试演示和问题复盘使用。"""
+    if trace_store is None:
+        raise HTTPException(status_code=503, detail="Trace SQLite Store 未启用")
+    return {
+        "traces": trace_store.list_task_runs(
+            limit=limit,
+            route_mode=route_mode,
+            status=status,
+        )
+    }
+
+
+@app.get("/api/traces/{trace_id}")
+async def get_trace_detail(trace_id: str, event_limit: int = 300):
+    """查看单次任务的事件、工具调用和治理决策。"""
+    if trace_store is None:
+        raise HTTPException(status_code=503, detail="Trace SQLite Store 未启用")
+    trace = trace_store.get_trace(trace_id, event_limit=event_limit)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Trace 不存在")
+    return trace
+
+
+@app.get("/api/trace-stats")
+async def get_trace_stats(limit: int = 100):
+    """统计最近 N 条任务的耗时、模型调用、工具调用和路由分布。"""
+    if trace_store is None:
+        raise HTTPException(status_code=503, detail="Trace SQLite Store 未启用")
+    return trace_store.summarize(limit=limit)
 
 
 @app.post("/api/task/{thread_id}/cancel")

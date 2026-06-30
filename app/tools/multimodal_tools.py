@@ -12,6 +12,7 @@ from app.multimodal.vision import (
     analyze_visual_document,
     is_visual_file,
 )
+from app.observability.evidence_pack import record_evidence
 from app.observability.tracing import summarize_text, trace_span
 from app.utils.path_utils import resolve_path
 
@@ -92,5 +93,19 @@ def analyze_visual_file(
             file_size=file_size,
             result_length=len(result),
             result_summary=summarize_text(result),
+        )
+        record_evidence(
+            source_type="file",
+            source_name=file_path.name,
+            source_locator=f"visual_ocr:{instruction}",
+            content=result,
+            confidence=0.85,
+            metadata={
+                "tool_name": "analyze_visual_file",
+                "filename": file_path.name,
+                "file_extension": file_path.suffix.lower(),
+                "file_size": file_size,
+                "visual": True,
+            },
         )
         return result

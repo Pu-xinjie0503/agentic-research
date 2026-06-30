@@ -363,14 +363,31 @@ def finish_trace(
             )
             assistant_calls[assistant_name] = assistant_calls.get(assistant_name, 0) + 1
 
+    route_events = [
+        event
+        for event in state.events
+        if event.get("event") == "execution_route_selected"
+    ]
+    execution_summary = {}
+    if route_events:
+        route_metadata = route_events[-1].get("metadata") or {}
+        execution_summary = {
+            "route": route_metadata.get("route"),
+            "route_mode": route_metadata.get("route_mode"),
+            "route_policy": route_metadata.get("route_policy"),
+            "task_scope": route_metadata.get("task_scope"),
+        }
+
     # 延迟导入避免 tracing 与搜索状态模块形成初始化循环。
     from app.observability.search_state import get_search_snapshot
     from app.observability.agent_state import get_agent_snapshot
     from app.observability.database_state import get_database_snapshot
+    from app.observability.evidence_pack import get_evidence_pack_snapshot
 
     search_summary = get_search_snapshot()
     agent_summary = get_agent_snapshot()
     database_summary = get_database_snapshot()
+    evidence_summary = get_evidence_pack_snapshot()
     model_summary = _build_model_summary(state.spans)
     performance_summary = _build_performance_summary(
         state.spans,
@@ -393,9 +410,11 @@ def finish_trace(
         "event_count": len(state.events),
         "tool_calls": tool_calls,
         "assistant_calls": assistant_calls,
+        "execution": execution_summary,
         "search": search_summary,
         "agent_governance": agent_summary,
         "database": database_summary,
+        "evidence": evidence_summary,
         "model": model_summary,
         "performance": performance_summary,
         "spans": [

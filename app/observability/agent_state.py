@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Optional
+
+from app.agent.governance_config import budget_int
 
 
 ALLOWED_SUPPLEMENT_REASONS = {
@@ -74,11 +75,7 @@ class TaskScope:
 
 def _read_positive_int(name: str, default: int) -> int:
     """读取正整数环境变量，非法配置回退到默认值。"""
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    return budget_int(name, default)
 
 
 def parse_supplement_context(description: str) -> tuple[Optional[str], str]:
@@ -320,6 +317,10 @@ def begin_agent_run(trace_id: str) -> Token[Optional[AgentRunState]]:
             trace_id=trace_id,
             soft_limit=soft_limit,
             hard_limit=hard_limit,
+            max_calls_per_agent=_read_positive_int(
+                "AGENT_MAX_CALLS_PER_AGENT",
+                2,
+            ),
         )
     )
 
