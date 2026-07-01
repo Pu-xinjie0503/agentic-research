@@ -14,6 +14,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
+from app.observability.evidence_pack import record_evidence
 from app.observability.tracing import summarize_text, trace_span
 from app.multimodal.vision import IMAGE_EXTENSIONS
 from app.utils.path_utils import resolve_path
@@ -33,6 +34,19 @@ try:
     import pandas as pd
 except ImportError:
     pd = None
+
+
+def _is_successful_file_result(result: str) -> bool:
+    """过滤错误提示、工具重定向提示和空结果，避免污染 Evidence Pack。"""
+    text = str(result or "").strip()
+    if not text:
+        return False
+    return not (
+        text.startswith("错误：")
+        or text.startswith("读取文件出错")
+        or text.startswith("读取 Excel 失败")
+        or "请调用 analyze_visual_file" in text
+    )
 
 
 @tool
@@ -90,6 +104,20 @@ def read_file_content(
                 result_length=len(result),
                 result_summary=summarize_text(result),
             )
+            if _is_successful_file_result(result):
+                record_evidence(
+                    source_type="file",
+                    source_name=file_path.name,
+                    source_locator=f"{ext or 'text'}:{instruction}",
+                    content=result,
+                    confidence=0.9,
+                    metadata={
+                        "tool_name": "read_file_content",
+                        "filename": file_path.name,
+                        "file_extension": ext,
+                        "file_size": file_path.stat().st_size,
+                    },
+                )
             return result
 
         try:

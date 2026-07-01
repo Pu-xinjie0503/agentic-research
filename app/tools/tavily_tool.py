@@ -14,6 +14,8 @@ from langchain_core.tools import tool
 from tavily import TavilyClient
 
 from app.api.monitor import monitor
+from app.agent.evidence import classify_source_tier
+from app.observability.evidence_pack import record_evidence
 from app.observability.search_state import get_search_run_state
 from app.observability.tracing import record_event, summarize_text, trace_span
 
@@ -242,6 +244,26 @@ def internet_search(
                 include_raw_content=include_raw_content,
             )
             result = compact_search_result(raw_result)
+            for item in result.get("results", []):
+                if not isinstance(item, dict):
+                    continue
+                record_evidence(
+                    source_type="network",
+                    source_name=str(item.get("title") or "网络来源"),
+                    source_url=str(item.get("url") or ""),
+                    source_locator=f"search:{query}",
+                    content=str(item.get("content") or ""),
+                    confidence=float(item.get("relevance_score") or 0.8),
+                    metadata={
+                        "query": query,
+                        "search_purpose": search_purpose,
+                        "source_tier": classify_source_tier(
+                            str(item.get("url") or ""),
+                            str(item.get("title") or ""),
+                        ),
+                        "published_date": item.get("published_date"),
+                    },
+                )
             control = (
                 search_state.complete(reservation, result=result)
                 if search_state and reservation

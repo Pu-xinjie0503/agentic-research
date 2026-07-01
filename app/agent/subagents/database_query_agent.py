@@ -8,6 +8,7 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 
 from app.agent.prompts import sub_agents_content
 from app.agent.handoff import AgentHandoff, HANDOFF_ERROR_MESSAGE
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.database_governance import DatabaseGovernanceMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
@@ -28,7 +29,10 @@ database_query_agent = {
     "tools": [list_sql_tables, get_table_data, execute_sql_query],
     "middleware": [
         ToolAllowlistMiddleware(
-            {"list_sql_tables", "get_table_data", "execute_sql_query"}
+            tool_allowlist(
+                "database_query_agent",
+                {"list_sql_tables", "get_table_data", "execute_sql_query"},
+            )
         ),
         DatabaseGovernanceMiddleware(),
         ModelTracingMiddleware("数据库查询助手"),

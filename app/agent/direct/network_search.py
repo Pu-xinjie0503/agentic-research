@@ -4,6 +4,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 
 from app.agent.llm import model
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.final_response_governance import (
     FinalResponseGovernanceMiddleware,
 )
@@ -24,7 +25,7 @@ network_search_direct_agent = create_agent(
         MemoryContextMiddleware(),
         SearchGovernanceMiddleware(direct_response=True),
         ToolAllowlistMiddleware(
-            {"internet_search"},
+            tool_allowlist("network_search_agent", {"internet_search"}),
             retry_unknown_tool_calls=True,
         ),
         FinalResponseGovernanceMiddleware(),

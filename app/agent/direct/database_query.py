@@ -4,6 +4,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 
 from app.agent.llm import model
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.database_governance import DatabaseGovernanceMiddleware
 from app.agent.middleware.memory_context import MemoryContextMiddleware
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
@@ -20,7 +21,10 @@ database_query_direct_agent = create_agent(
     middleware=[
         MemoryContextMiddleware(),
         ToolAllowlistMiddleware(
-            {"list_sql_tables", "get_table_data", "execute_sql_query"},
+            tool_allowlist(
+                "database_query_agent",
+                {"list_sql_tables", "get_table_data", "execute_sql_query"},
+            ),
             retry_unknown_tool_calls=True,
         ),
         DatabaseGovernanceMiddleware(direct_response=True),

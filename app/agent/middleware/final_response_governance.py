@@ -19,6 +19,7 @@ from app.observability.search_state import (
     get_search_evidence_records,
     get_search_snapshot,
 )
+from app.observability.evidence_pack import get_evidence_records
 from app.observability.tracing import record_event
 
 
@@ -74,7 +75,7 @@ class FinalResponseGovernanceMiddleware(AgentMiddleware):
         content = message.text or str(message.content)
         unsupported_claims = find_unsupported_precision_claims(
             content,
-            get_search_evidence_records(),
+            _network_evidence_records(),
         )
         if unsupported_claims:
             return True
@@ -129,7 +130,7 @@ class FinalResponseGovernanceMiddleware(AgentMiddleware):
         cited_urls = URL_PATTERN.findall(content)
         verified_urls = {
             str(item.get("source_url") or "")
-            for item in get_search_evidence_records()
+            for item in _network_evidence_records()
         }
         verified_citation_count = sum(
             url.rstrip(".,，。；;") in verified_urls
@@ -143,7 +144,7 @@ class FinalResponseGovernanceMiddleware(AgentMiddleware):
             )
         unsupported = find_unsupported_precision_claims(
             content,
-            get_search_evidence_records(),
+            _network_evidence_records(),
         )
         if unsupported:
             examples = "；".join(unsupported[:3])
@@ -195,6 +196,29 @@ def _last_ai_message(response: Any) -> AIMessage | None:
             if isinstance(message, AIMessage):
                 return message
     return None
+
+
+def _network_evidence_records() -> list[dict[str, Any]]:
+    """合并搜索治理目录和 Evidence Pack 网络证据。"""
+    records = list(get_search_evidence_records())
+    seen_urls = {str(item.get("source_url") or "") for item in records}
+    for item in get_evidence_records(source_type="network"):
+        source_url = str(item.get("source_url") or "")
+        if not source_url or source_url in seen_urls:
+            continue
+        records.append(
+            {
+                "source_url": source_url,
+                "source_title": item.get("source_name") or "",
+                "source_tier": (item.get("metadata") or {}).get("source_tier")
+                or "unknown",
+                "published_at": (item.get("metadata") or {}).get("published_date")
+                or "",
+                "evidence_excerpt": item.get("content") or "",
+            }
+        )
+        seen_urls.add(source_url)
+    return records
 
 
 def _has_generated_artifact() -> bool:

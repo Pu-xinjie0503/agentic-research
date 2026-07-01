@@ -8,6 +8,7 @@ DeepAgents 可识别的字典式子智能体。主智能体后续会根据 descr
 
 from app.agent.prompts import sub_agents_content
 from app.agent.handoff import AgentHandoff, HANDOFF_ERROR_MESSAGE
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.search_governance import SearchGovernanceMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
@@ -29,7 +30,7 @@ network_search_agent = {
     "middleware": [
         SearchGovernanceMiddleware(),
         ToolAllowlistMiddleware(
-            {"internet_search"},
+            tool_allowlist("network_search_agent", {"internet_search"}),
             retry_unknown_tool_calls=True,
             response_tools={"AgentHandoff"},
         ),

@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import unicodedata
 from contextvars import ContextVar, Token
@@ -18,6 +17,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
 from app.agent.evidence import EvidenceRecord
+from app.agent.governance_config import budget_float, budget_int
 
 
 ALLOWED_CONTINUATION_REASONS = {
@@ -34,20 +34,12 @@ _search_state_ctx: ContextVar[Optional["SearchRunState"]] = ContextVar(
 
 def _read_int_env(name: str, default: int) -> int:
     """读取正整数环境变量，配置非法时使用默认值。"""
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    return budget_int(name, default)
 
 
 def _read_float_env(name: str, default: float) -> float:
     """读取 0 到 1 之间的浮点环境变量，配置非法时使用默认值。"""
-    try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if 0 < value <= 1 else default
+    return budget_float(name, default)
 
 
 def normalize_query(query: str) -> str:
@@ -528,13 +520,20 @@ def get_search_run_state() -> Optional[SearchRunState]:
     return _search_state_ctx.get()
 
 
-def configure_search_run(*, hard_limit: int) -> None:
-    """按任务复杂度收紧当前搜索硬预算，保留环境变量设置的更低上限。"""
+def configure_search_run(
+    *,
+    hard_limit: int | None = None,
+    soft_limit: int | None = None,
+) -> None:
+    """按路由策略收紧当前搜索预算，保留已配置的更低上限。"""
     state = get_search_run_state()
-    if state is None or hard_limit <= 0:
+    if state is None:
         return
     with state.lock:
-        state.hard_limit = min(state.hard_limit, hard_limit)
+        if hard_limit and hard_limit > 0:
+            state.hard_limit = min(state.hard_limit, hard_limit)
+        if soft_limit and soft_limit > 0:
+            state.soft_limit = min(state.soft_limit, soft_limit)
         state.soft_limit = min(state.soft_limit, state.hard_limit)
 
 

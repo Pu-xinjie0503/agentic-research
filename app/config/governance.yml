@@ -1,0 +1,69 @@
+# DeepSearch Agent Governance 配置
+#
+# 这里集中声明工具可见性、专家调用预算、SQL/搜索预算和路由级策略。
+# 环境变量仍可覆盖预算类配置，便于压测或面试演示时临时调整。
+
+budgets:
+  agent_call_soft_limit: 3
+  agent_call_hard_limit: 5
+  agent_max_calls_per_agent: 2
+  internet_search_soft_limit: 3
+  internet_search_hard_limit: 5
+  internet_search_similarity_threshold: 0.82
+  database_query_soft_limit: 3
+  database_query_hard_limit: 5
+
+agents:
+  main_agent:
+    allowed_tools:
+      - task
+      - generate_markdown
+      - convert_md_to_pdf
+  network_search_agent:
+    allowed_tools:
+      - internet_search
+  database_query_agent:
+    allowed_tools:
+      - list_sql_tables
+      - get_table_data
+      - execute_sql_query
+  file_analysis_agent:
+    allowed_tools:
+      - read_file_content
+      - analyze_visual_file
+
+routes:
+  main_agent:
+    allowed_subagents:
+      - 网络搜索助手
+      - 数据库查询助手
+      - 文件分析助手
+    search_hard_limit: 3
+    allow_network: true
+    allow_database: true
+    allow_file: true
+  network_direct:
+    allowed_subagents:
+      - 网络搜索助手
+    search_hard_limit: 5
+    allow_network: true
+    allow_database: false
+    allow_file: false
+  database_direct:
+    allowed_subagents:
+      - 数据库查询助手
+    database_hard_limit: 5
+    allow_network: false
+    allow_database: true
+    allow_file: false
+  file_direct:
+    allowed_subagents:
+      - 文件分析助手
+    allow_network: false
+    allow_database: false
+    allow_file: true
+  memory_direct:
+    allowed_subagents: []
+    allow_network: false
+    allow_database: false
+    allow_file: false

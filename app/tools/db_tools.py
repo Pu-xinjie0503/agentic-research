@@ -16,6 +16,7 @@ from mysql.connector import Error, connect
 
 from app.api.monitor import monitor
 from app.observability.database_state import get_database_run_state
+from app.observability.evidence_pack import record_evidence
 from app.observability.tracing import record_event
 from app.observability.tracing import summarize_text, trace_span
 
@@ -100,6 +101,16 @@ def _load_table_names(config: dict) -> list[str]:
         with conn.cursor() as cursor:
             cursor.execute("SHOW TABLES")
             return [str(table[0]) for table in cursor.fetchall()]
+
+
+def _extract_sql_table_names(query: str) -> list[str]:
+    """从只读 SQL 中提取 FROM/JOIN 后的表名，供证据定位使用。"""
+    names = re.findall(
+        r"\b(?:from|join)\s+`?([A-Za-z0-9_]+)`?",
+        query,
+        flags=re.IGNORECASE,
+    )
+    return list(dict.fromkeys(names))
 
 
 # 集中读取数据库配置，后续三个工具都复用这份连接参数
@@ -290,6 +301,20 @@ def get_table_data(table_name: str, row_limit: int = 8) -> str:
                             database_state.table_names.update(table_names)
                             if truncated:
                                 database_state.truncated_result_count += 1
+                    record_evidence(
+                        source_type="database",
+                        source_name=table_name,
+                        source_locator=sql,
+                        content=result,
+                        confidence=0.8,
+                        metadata={
+                            "tool_name": "get_table_data",
+                            "row_count": len(rows),
+                            "column_count": len(columns),
+                            "columns": columns,
+                            "truncated": truncated,
+                        },
+                    )
                     span.set_result(
                         row_count=len(rows),
                         column_count=len(columns),
@@ -450,6 +475,21 @@ def execute_sql_query(
                             result=result,
                             truncated=truncated,
                         )
+                    table_names = _extract_sql_table_names(query)
+                    record_evidence(
+                        source_type="database",
+                        source_name=", ".join(table_names) or "MySQL 查询结果",
+                        source_locator=query,
+                        content=result,
+                        confidence=1.0,
+                        metadata={
+                            "tool_name": "execute_sql_query",
+                            "row_count": len(rows),
+                            "column_count": len(columns),
+                            "columns": columns,
+                            "truncated": truncated,
+                        },
+                    )
                     span.set_result(
                         row_count=len(rows),
                         column_count=len(columns),

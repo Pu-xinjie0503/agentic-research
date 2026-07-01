@@ -4,6 +4,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 
 from app.agent.llm import model
+from app.agent.governance_config import tool_allowlist
 from app.agent.middleware.memory_context import MemoryContextMiddleware
 from app.agent.middleware.model_tracing import ModelTracingMiddleware
 from app.agent.middleware.tool_allowlist import ToolAllowlistMiddleware
@@ -20,7 +21,10 @@ file_analysis_direct_agent = create_agent(
     middleware=[
         MemoryContextMiddleware(),
         ToolAllowlistMiddleware(
-            {"read_file_content", "analyze_visual_file"}
+            tool_allowlist(
+                "file_analysis_agent",
+                {"read_file_content", "analyze_visual_file"},
+            )
         ),
         ModelTracingMiddleware("文件分析助手"),
         ModelCallLimitMiddleware(run_limit=4, exit_behavior="error"),

@@ -13,6 +13,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from app.observability.trace_store import trace_store
+
 
 _write_lock = Lock()
 _app_root = Path(__file__).resolve().parents[1]
@@ -37,3 +39,9 @@ def write_json_log(record: dict[str, Any]) -> None:
     with _write_lock:
         with log_file.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+    if trace_store is not None:
+        try:
+            trace_store.record(record)
+        except Exception as exc:
+            print(f"[TraceStore] SQLite 写入失败，已保留 JSONL 日志：{exc}")
