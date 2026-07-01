@@ -27,11 +27,14 @@
   -> FastAPI 接口接收请求
   -> 长期记忆治理：候选提取、增删、跨线程召回
   -> run_deep_agent 创建会话目录并写入上下文
-  -> 主智能体分析任务
-  -> 分派给网络搜索助手 / 数据库查询助手 / 文件分析助手
+  -> 统一入口推断能力范围并选择执行路线
+  -> 纯网络 / 数据库 / 文件任务直达专家智能体
+  -> 组合任务或文件交付回到主智能体编排
+  -> 读取 governance.yml 收紧工具权限、专家范围和调用预算
   -> 主智能体汇总多来源信息
+  -> Evidence Pack 记录网络、数据库、文件和多模态证据
   -> 调用文件工具生成 Markdown / PDF
-  -> monitor 通过 WebSocket 推送进度
+  -> monitor 通过 WebSocket 推送进度，Trace Store 持久化链路
   -> 前端展示事件、答案和文件列表
 ```
 
@@ -40,14 +43,25 @@
 - **一主三从的多智能体架构**
   - 主智能体负责理解任务、规划步骤、调度助手和最终汇总。
   - 网络搜索助手、数据库查询助手、文件分析助手分别处理不同信息来源。
+- **意图直达路由，减少无效编排**
+  - 统一入口推断网络、数据库、文件和交付物需求。
+  - 纯网络、纯数据库、纯文件请求直接进入对应专家智能体，组合查询或 Markdown/PDF 交付回到主智能体。
+  - 路由消融评测中，最小验收集下模型调用下降 `52.38%`，Token 下降 `75.88%`，总耗时下降 `40.36%`。
 - **多来源检索，而不是模型裸答**
   - `Tavily` 负责互联网公开资料检索。
   - `MySQL` 负责查询结构化业务数据。
   - 文件分析助手负责读取和分析本次会话上传的附件。
+- **配置化 Agent Governance**
+  - `app/config/governance.yml` 集中声明工具白名单、路由策略、搜索/SQL 预算和专家可用范围。
+  - 环境变量可覆盖预算类配置，便于演示、压测和不同环境调参。
+- **Evidence Pack 证据治理**
+  - 网络 URL、数据库 SQL 与结果摘要、文件/OCR 分析结果都会沉淀为可追溯证据。
+  - 最终回答基于证据包约束引用、数字和来源边界，减少无依据结论。
 - **从检索到交付的完整可运行链路**
   - 不停留在 Prompt 设计，而是会真实调用工具、读取数据、生成 Markdown，并在需要时转换成 PDF。
 - **长任务执行过程可观察**
   - 工具调用、子智能体调用、工作目录创建、任务结果、取消和异常都会通过 `monitor` 推送到前端。
+  - SQLite Trace Store 持久化任务、事件、工具调用、Agent 决策和证据记录，并提供查询接口。
 - **会话级上下文隔离**
   - 通过 `thread_id` 和 `session_dir` 区分不同任务，`ContextVar` 让深层工具也能拿到当前会话身份和文件目录。
 - **三层记忆边界**
@@ -59,7 +73,7 @@
 - **工程化前后端结构清晰**
   - 基于 `FastAPI + WebSocket + DeepAgents + React` 组织任务接口、异步执行、事件推送、文件上传和文件下载。
 - **面向演示与扩展**
-  - 核心链路包含任务路由、工具治理、长期记忆、多模态文件分析、可观察性和自动评测。
+  - 核心链路包含任务路由、工具治理、长期记忆、多模态文件分析、证据治理、Trace Store 和自动评测。
   - 模块边界清晰，可继续扩展任务队列、事件持久化、鉴权与更完整的评测体系。
 
 ## 🏗️ 系统架构
@@ -74,6 +88,8 @@
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------- |
 | 多智能体深度研搜 | 基于用户任务完成规划、分派、检索、读取附件、汇总和生成交付物 | `DeepAgents` / `LangChain` / `LangGraph` / `Tavily` / `MySQL` / 文件分析 |
 | 前后端实时闭环   | 启动后台任务、上传文件、推送执行过程、展示结果和下载生成文件 | `FastAPI` / `WebSocket` / `React` / `Vite`                                |
+| 治理与证据链     | 控制工具权限、专家预算、SQL 安全和最终回答证据边界           | `Tool Allowlist` / `Agent Governance` / `governance.yml` / `Evidence Pack` |
+| 可观测与评测     | 记录任务链路、统计调用成本并对比路由优化效果                 | `trace_id` / `SQLite Trace Store` / `baseline` / `routing_ablation`       |
 
 ### 智能体与工具
 
@@ -97,6 +113,8 @@
 | 网络搜索       | `Tavily`                                         | 为网络搜索助手提供公开资料检索                                                |
 | 结构化数据     | `MySQL` / `mysql-connector-python`               | 为数据库助手提供药品、库存、销售等结构化业务数据                              |
 | 文件处理       | `pypdf` / `PyMuPDF` / `Pillow` / `python-docx` / `pandas` | 读取附件、渲染扫描 PDF、压缩图片、生成 Markdown/PDF               |
+| 治理配置       | `YAML`                                           | 通过 `app/config/governance.yml` 管理工具白名单、路由策略和调用预算            |
+| 持久化观测     | `SQLite`                                         | 保存长期记忆、任务链路、工具调用、Agent 决策和证据记录                         |
 | 后端接口       | `FastAPI` / `Uvicorn`                            | 提供任务、取消、上传、文件列表、下载和 WebSocket 接口                         |
 | 实时通信       | `WebSocket`                                      | 推送工具调用、助手调用、最终结果和错误事件                                    |
 | 前端           | `React` / `Vite` / `Ant Design` / `Tailwind CSS` | 提供对话式研搜界面、事件流、附件上传和文件下载                                |
@@ -108,7 +126,10 @@
 deepsearch-agents/
 ├── app/
 │   ├── agent/
+│   │   ├── direct/                 # 网络、数据库、文件三类直达智能体
+│   │   ├── middleware/             # 工具白名单、最终回答治理等中间件
 │   │   ├── subagents/              # 网络搜索、数据库查询、文件分析三个子智能体
+│   │   ├── governance_config.py    # 读取 governance.yml 与环境变量覆盖
 │   │   ├── llm.py                  # OpenAI 兼容模型初始化
 │   │   ├── main_agent.py           # 主智能体组装与 run_deep_agent 执行入口
 │   │   └── prompts.py              # 读取 app/prompt/prompts.yml
@@ -116,9 +137,13 @@ deepsearch-agents/
 │   │   ├── context.py              # ContextVar 保存 user_id、thread_id 和 session_dir
 │   │   ├── monitor.py              # 工具调用、助手调用、结果和异常事件推送
 │   │   └── server.py               # FastAPI 任务、上传、文件、下载、WebSocket 接口
+│   ├── config/
+│   │   └── governance.yml          # 工具白名单、路由策略和调用预算配置
+│   ├── evaluation/                 # 基线评测、路由消融、多模态和记忆演示脚本
 │   ├── memory/                     # SQLite BaseStore、记忆提取、治理、召回与审计
 │   ├── multimodal/                 # 图片压缩、扫描 PDF 渲染和视觉模型调用
-│   ├── data/                       # 运行时生成：memory.sqlite3，不提交
+│   ├── observability/              # trace、预算状态、Evidence Pack 和 SQLite Trace Store
+│   ├── data/                       # 运行时生成：memory.sqlite3、trace.sqlite3，不提交
 │   ├── prompt/
 │   │   └── prompts.yml             # 主智能体和子智能体提示词配置
 │   ├── tools/                      # Tavily、MySQL、文件读取、Markdown、PDF 工具
@@ -218,6 +243,9 @@ uv run uvicorn app.api.server:app --host 0.0.0.0 --port 8000 --reload
 | `GET /api/memories`                 | 按 `user_id` 查看长期记忆               |
 | `DELETE /api/memories/{id}`         | 软删除单条长期记忆                      |
 | `DELETE /api/memories`              | 清空指定用户的长期记忆                  |
+| `GET /api/traces`                   | 查看任务 trace 列表                     |
+| `GET /api/traces/{trace_id}`        | 查看单次任务链路详情                    |
+| `GET /api/trace-stats`              | 查看 trace 汇总统计                     |
 | `GET /api/files`                    | 列出当前会话输出目录中的生成文件       |
 | `GET /api/download`                 | 下载输出目录中的文件                   |
 | `WebSocket /ws/{thread_id}`         | 推送工具调用、助手调用、结果和异常事件 |
@@ -276,6 +304,15 @@ VITE_WS_BASE_URL=ws://localhost:8000
 app/logs/traces/YYYY-MM-DD.jsonl
 ```
 
+SQLite Trace Store 默认保存在：
+
+```text
+app/data/trace.sqlite3
+```
+
+它会持久化任务运行、事件、工具调用、Agent 决策和 Evidence Pack 证据记录。可通过
+`/api/traces`、`/api/traces/{trace_id}` 和 `/api/trace-stats` 查看。
+
 离线评测只读取已有日志，不调用大模型、Tavily 或 MySQL：
 
 ```bash
@@ -310,12 +347,33 @@ uv run python app/evaluation/run_baseline.py --tasks database_query network_sear
 基线报告保存在 `app/logs/baselines/`，包含模型调用次数、分 Agent 耗时、
 token、工具墙钟耗时、搜索执行与拦截次数。
 
+路由消融评测用于对比“所有任务强制主智能体编排”和“单能力任务直达专家智能体”
+两种模式：
+
+```bash
+uv run python app/evaluation/run_routing_ablation.py
+```
+
+当前最小验收集包含纯网络、纯数据库、纯文件 3 组有效配对，结果显示模型调用下降
+`52.38%`，Token 下降 `75.88%`，总耗时下降 `40.36%`。报告保存在
+`app/logs/routing_ablation/`。
+
 多模态演示会生成一张包含中文、数字和柱状图的图片，并验证图片与扫描
 PDF 两条路径。该命令会调用视觉模型：
 
 ```bash
 uv run python app/evaluation/run_multimodal_demo.py --mode both
 ```
+
+### 10. 运行自动化测试
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+当前测试覆盖路由、工具白名单、重复调用拦截、SQL 只读校验、长期记忆持久化与用户隔离、
+上传安全、多模态预处理、Evidence Pack、SQLite Trace Store、配置化 Governance 和评测函数。
+最新回归结果为 `127` 项测试全部通过。
 
 ## 🚧 能力边界
 
@@ -326,9 +384,9 @@ uv run python app/evaluation/run_multimodal_demo.py --mode both
 - 用户登录、角色权限和多租户隔离；
 - 文件上传安全扫描和内容审核；
 - 任务队列、分布式执行和大规模并发治理；
-- 全量事件持久化、历史会话恢复和审计追踪；
+- 历史会话恢复、跨实例事件总线和完整审计后台；
 - 更大规模的线上评测集、持续回归和人工标注质量评估；
-- 生产监控、告警、链路追踪和灰度发布；
+- 生产级 OpenTelemetry、监控告警、链路追踪和灰度发布；
 - 复杂报告编辑、协同工作流和权限化文件管理。
 
 这些能力可在现有主链路之上继续扩展，当前仓库聚焦于保持核心功能完整、可运行、可测试和便于演示。
